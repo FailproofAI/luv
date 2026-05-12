@@ -316,7 +316,8 @@ def navigate(clone_dir: Path, extra_env: dict[str, str] = {}) -> None:
         os.execv(shell, [shell])
 
 
-def resume(clone_dir: Path, extra_env: dict[str, str] = {}) -> None:
+def resume(clone_dir: Path, extra_env: dict[str, str] = {},
+           model: str = "claude-opus-4-7") -> None:
     """Trust, chdir, and exec claude --resume — replacing this process."""
     trust_project(clone_dir)
     os.chdir(str(clone_dir))
@@ -330,7 +331,7 @@ def resume(clone_dir: Path, extra_env: dict[str, str] = {}) -> None:
             base = docker_compose_base(clone_dir, compose_file, project)
             r = subprocess.run(base + ["exec", "-it"] + docker_env_flags(extra_env) + ["dev-environment",
                                        "claude", "--dangerously-skip-permissions",
-                                       "--model", "claude-opus-4-7",
+                                       "--model", model,
                                        "--effort", "max", "--resume",
                                        "--remote-control",
                                        "--remote-control-session-name-prefix", clone_dir.name])
@@ -343,13 +344,14 @@ def resume(clone_dir: Path, extra_env: dict[str, str] = {}) -> None:
             die("'claude' not found in PATH")
         os.environ.update(extra_env)
         os.execv(claude_bin, [claude_bin, "--dangerously-skip-permissions",
-                              "--model", "claude-opus-4-7", "--effort", "max", "--resume",
+                              "--model", model, "--effort", "max", "--resume",
                               "--remote-control",
                               "--remote-control-session-name-prefix", clone_dir.name])
 
 
 def launch(clone_dir: Path, prompt: str | None, plan_mode: bool = False,
-           non_interactive: bool = False, extra_env: dict[str, str] = {}) -> None:
+           non_interactive: bool = False, extra_env: dict[str, str] = {},
+           model: str = "claude-opus-4-7") -> None:
     """Trust, resolve claude, chdir, and exec — replacing this process."""
     trust_project(clone_dir)
     os.chdir(str(clone_dir))
@@ -357,7 +359,7 @@ def launch(clone_dir: Path, prompt: str | None, plan_mode: bool = False,
     compose_file = (settings or {}).get("compose_file")
 
     common_flags = ["--dangerously-skip-permissions",
-                    "--model", "claude-opus-4-7",
+                    "--model", model,
                     "--effort", "max",
                     "--remote-control",
                     "--remote-control-session-name-prefix", clone_dir.name]
@@ -504,7 +506,7 @@ def find_latest_clone(repo: str) -> Path | None:
     return best
 
 
-def open_existing(org: str, repo: str, number: int, prompt: str | None, nav_mode: bool = False, resume_mode: bool = False, plan_mode: bool = False, non_interactive: bool = False, extra_env: dict[str, str] = {}) -> None:
+def open_existing(org: str, repo: str, number: int, prompt: str | None, nav_mode: bool = False, resume_mode: bool = False, plan_mode: bool = False, non_interactive: bool = False, extra_env: dict[str, str] = {}, model: str = "claude-opus-4-7") -> None:
     """Open an existing work folder or remote branch by number."""
     clone_dir = PRS_DIR / f"{repo}-{number}"
 
@@ -515,9 +517,9 @@ def open_existing(org: str, repo: str, number: int, prompt: str | None, nav_mode
         if nav_mode:
             navigate(clone_dir, extra_env=extra_env)
         elif resume_mode:
-            resume(clone_dir, extra_env=extra_env)
+            resume(clone_dir, extra_env=extra_env, model=model)
         else:
-            launch(clone_dir, prompt, plan_mode=plan_mode, non_interactive=non_interactive, extra_env=extra_env)
+            launch(clone_dir, prompt, plan_mode=plan_mode, non_interactive=non_interactive, extra_env=extra_env, model=model)
         return  # unreachable
 
     # 2. Check remote branch luv-{number}
@@ -542,12 +544,12 @@ def open_existing(org: str, repo: str, number: int, prompt: str | None, nav_mode
     if nav_mode:
         navigate(clone_dir, extra_env=extra_env)
     elif resume_mode:
-        resume(clone_dir, extra_env=extra_env)
+        resume(clone_dir, extra_env=extra_env, model=model)
     else:
-        launch(clone_dir, prompt, plan_mode=plan_mode, non_interactive=non_interactive, extra_env=extra_env)
+        launch(clone_dir, prompt, plan_mode=plan_mode, non_interactive=non_interactive, extra_env=extra_env, model=model)
 
 
-def open_pr(org: str, repo: str, number: int, prompt: str | None, nav_mode: bool = False, resume_mode: bool = False, plan_mode: bool = False, non_interactive: bool = False, extra_env: dict[str, str] = {}) -> None:
+def open_pr(org: str, repo: str, number: int, prompt: str | None, nav_mode: bool = False, resume_mode: bool = False, plan_mode: bool = False, non_interactive: bool = False, extra_env: dict[str, str] = {}, model: str = "claude-opus-4-7") -> None:
     """Open any GitHub PR by org/repo/number, cloning if needed."""
     clone_dir = PRS_DIR / f"{repo}-{number}"
 
@@ -557,9 +559,9 @@ def open_pr(org: str, repo: str, number: int, prompt: str | None, nav_mode: bool
         if nav_mode:
             navigate(clone_dir, extra_env=extra_env)
         elif resume_mode:
-            resume(clone_dir, extra_env=extra_env)
+            resume(clone_dir, extra_env=extra_env, model=model)
         else:
-            launch(clone_dir, prompt, plan_mode=plan_mode, non_interactive=non_interactive, extra_env=extra_env)
+            launch(clone_dir, prompt, plan_mode=plan_mode, non_interactive=non_interactive, extra_env=extra_env, model=model)
         return  # unreachable
 
     # Resolve the actual branch name via GitHub API
@@ -584,9 +586,9 @@ def open_pr(org: str, repo: str, number: int, prompt: str | None, nav_mode: bool
     if nav_mode:
         navigate(clone_dir, extra_env=extra_env)
     elif resume_mode:
-        resume(clone_dir, extra_env=extra_env)
+        resume(clone_dir, extra_env=extra_env, model=model)
     else:
-        launch(clone_dir, prompt, plan_mode=plan_mode, non_interactive=non_interactive, extra_env=extra_env)
+        launch(clone_dir, prompt, plan_mode=plan_mode, non_interactive=non_interactive, extra_env=extra_env, model=model)
 
 
 def main() -> None:
@@ -599,6 +601,16 @@ def main() -> None:
     force = "-f" in args or "--force" in args
     safe = "--safe" in args
     env_mode = "-e" in args
+
+    # -m takes a value, so extract it before the boolean-flag strip below
+    model = "claude-opus-4-7"
+    if "-m" in args:
+        idx = args.index("-m")
+        if idx + 1 >= len(args):
+            die("-m requires a model name")
+        model = args[idx + 1]
+        args = args[:idx] + args[idx + 2:]
+
     args = [a for a in args if a not in ("-n", "-r", "-e", "-f", "--force", "-p", "-nit", "--safe")]
     extra_env = collect_luv_env() if env_mode else {}
 
@@ -611,6 +623,7 @@ Flags:
   -r            resume: resume the last Claude session in the work folder
   -p            launch Claude in plan permission mode (default: bypassPermissions)
   -nit          non-interactive: run claude -p <prompt> and exit (no REPL)
+  -m MODEL      claude model to use (default: claude-opus-4-7)
   -e            env: pass LUV_* environment variables (with prefix stripped) into the session
   -f, --force   (with --clean) skip safety checks and delete all work folders
   --safe        (with --clean -f) only delete folders older than 24h
@@ -656,7 +669,7 @@ Docker:
             die(f"cannot parse PR URL: {url}")
         org, repo, number = m.group(1), m.group(2), int(m.group(3))
         prompt = " ".join(args[2:]) or None
-        open_pr(org, repo, number, prompt, nav_mode, resume_mode, plan_mode, non_interactive, extra_env=extra_env)
+        open_pr(org, repo, number, prompt, nav_mode, resume_mode, plan_mode, non_interactive, extra_env=extra_env, model=model)
         return
 
     raw = args[0].rstrip("/")
@@ -676,14 +689,14 @@ Docker:
             die(f"expected a PR number after -pr, got '{args[idx + 1]}'")
         prompt_parts = [a for i, a in enumerate(args) if i not in (0, idx, idx + 1)]
         prompt = " ".join(prompt_parts) or None
-        open_pr(resolve_org(explicit_org), repo, number, prompt, nav_mode, resume_mode, plan_mode, non_interactive, extra_env=extra_env)
+        open_pr(resolve_org(explicit_org), repo, number, prompt, nav_mode, resume_mode, plan_mode, non_interactive, extra_env=extra_env, model=model)
         return
 
     # Detect optional numeric second argument
     if len(args) > 1 and args[1].isdigit():
         number = int(args[1])
         prompt = " ".join(args[2:]) or None
-        open_existing(resolve_org(explicit_org), repo, number, prompt, nav_mode, resume_mode, plan_mode, non_interactive, extra_env=extra_env)
+        open_existing(resolve_org(explicit_org), repo, number, prompt, nav_mode, resume_mode, plan_mode, non_interactive, extra_env=extra_env, model=model)
         return
 
     org = resolve_org(explicit_org)
@@ -698,7 +711,7 @@ Docker:
         if nav_mode:
             navigate(clone_dir, extra_env=extra_env)
         else:
-            resume(clone_dir, extra_env=extra_env)
+            resume(clone_dir, extra_env=extra_env, model=model)
         return
 
     # 1. Verify repo exists
@@ -750,6 +763,6 @@ Docker:
     if nav_mode:
         navigate(clone_dir, extra_env=extra_env)
     elif resume_mode:
-        resume(clone_dir, extra_env=extra_env)
+        resume(clone_dir, extra_env=extra_env, model=model)
     else:
-        launch(clone_dir, prompt, plan_mode=plan_mode, non_interactive=non_interactive, extra_env=extra_env)
+        launch(clone_dir, prompt, plan_mode=plan_mode, non_interactive=non_interactive, extra_env=extra_env, model=model)
