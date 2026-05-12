@@ -316,9 +316,10 @@ def navigate(clone_dir: Path, extra_env: dict[str, str] = {}) -> None:
         os.execv(shell, [shell])
 
 
-def resume(clone_dir: Path, extra_env: dict[str, str] = {},
+def resume(clone_dir: Path, extra_env: dict[str, str] | None = None,
            model: str = "claude-opus-4-7") -> None:
     """Trust, chdir, and exec claude --resume — replacing this process."""
+    extra_env = extra_env or {}
     trust_project(clone_dir)
     os.chdir(str(clone_dir))
     settings = load_luv_settings(clone_dir)
@@ -350,9 +351,10 @@ def resume(clone_dir: Path, extra_env: dict[str, str] = {},
 
 
 def launch(clone_dir: Path, prompt: str | None, plan_mode: bool = False,
-           non_interactive: bool = False, extra_env: dict[str, str] = {},
+           non_interactive: bool = False, extra_env: dict[str, str] | None = None,
            model: str = "claude-opus-4-7") -> None:
     """Trust, resolve claude, chdir, and exec — replacing this process."""
+    extra_env = extra_env or {}
     trust_project(clone_dir)
     os.chdir(str(clone_dir))
     settings = load_luv_settings(clone_dir)
@@ -506,8 +508,9 @@ def find_latest_clone(repo: str) -> Path | None:
     return best
 
 
-def open_existing(org: str, repo: str, number: int, prompt: str | None, nav_mode: bool = False, resume_mode: bool = False, plan_mode: bool = False, non_interactive: bool = False, extra_env: dict[str, str] = {}, model: str = "claude-opus-4-7") -> None:
+def open_existing(org: str, repo: str, number: int, prompt: str | None, nav_mode: bool = False, resume_mode: bool = False, plan_mode: bool = False, non_interactive: bool = False, extra_env: dict[str, str] | None = None, model: str = "claude-opus-4-7") -> None:
     """Open an existing work folder or remote branch by number."""
+    extra_env = extra_env or {}
     clone_dir = PRS_DIR / f"{repo}-{number}"
 
     # 1. Local folder takes priority
@@ -549,8 +552,9 @@ def open_existing(org: str, repo: str, number: int, prompt: str | None, nav_mode
         launch(clone_dir, prompt, plan_mode=plan_mode, non_interactive=non_interactive, extra_env=extra_env, model=model)
 
 
-def open_pr(org: str, repo: str, number: int, prompt: str | None, nav_mode: bool = False, resume_mode: bool = False, plan_mode: bool = False, non_interactive: bool = False, extra_env: dict[str, str] = {}, model: str = "claude-opus-4-7") -> None:
+def open_pr(org: str, repo: str, number: int, prompt: str | None, nav_mode: bool = False, resume_mode: bool = False, plan_mode: bool = False, non_interactive: bool = False, extra_env: dict[str, str] | None = None, model: str = "claude-opus-4-7") -> None:
     """Open any GitHub PR by org/repo/number, cloning if needed."""
+    extra_env = extra_env or {}
     clone_dir = PRS_DIR / f"{repo}-{number}"
 
     if clone_dir.exists():
@@ -604,6 +608,8 @@ def main() -> None:
 
     # -m takes a value, so extract it before the boolean-flag strip below
     model = "claude-opus-4-7"
+    if args.count("-m") > 1:
+        die("-m may only be provided once")
     if "-m" in args:
         idx = args.index("-m")
         if idx + 1 >= len(args):
