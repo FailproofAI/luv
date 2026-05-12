@@ -614,7 +614,9 @@ def main() -> None:
         idx = args.index("-m")
         if idx + 1 >= len(args):
             die("-m requires a model name")
-        model = args[idx + 1]
+        model = args[idx + 1].strip()
+        if not model or model.startswith("-"):
+            die("-m requires a model name")
         args = args[:idx] + args[idx + 2:]
 
     args = [a for a in args if a not in ("-n", "-r", "-e", "-f", "--force", "-p", "-nit", "--safe")]
