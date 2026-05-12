@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "luv-cli"
-version = "0.0.17"
+version = "0.0.18"
 description = "Launch Claude Code agents on GitHub repos with isolated workspaces and optional Docker dev environments"
 requires-python = ">=3.10"
 license = "MIT"
