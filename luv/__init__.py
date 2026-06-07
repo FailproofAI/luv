@@ -411,10 +411,36 @@ def _on_rm_error(func, path, _exc):
     func(path)
 
 
+def _docker_wipe(path: Path) -> bool:
+    """rm -rf `path` from inside a busybox container so the container's root can
+    delete files that a previous container bind-mounted in as root (e.g. Rust
+    target dirs built inside the workspace's dev-environment). Returns True on
+    success. No-op if docker isn't available."""
+    if shutil.which("docker") is None:
+        return False
+    parent = path.resolve().parent
+    name = path.name
+    r = subprocess.run(
+        ["docker", "run", "--rm",
+         "-v", f"{parent}:/p",
+         "busybox", "rm", "-rf", f"/p/{name}"],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        sys.stderr.write(f"luv: docker rm fallback failed for {path}: {r.stderr.strip()}\n")
+        return False
+    return not path.exists()
+
+
 def _force_rmtree(path: Path) -> None:
-    """rmtree that chmods read-only files (e.g. uv's CACHEDIR.TAG) instead of crashing."""
+    """rmtree that survives read-only files (chmod-and-retry) and root-owned
+    files left behind by Docker bind-mounts (containerized rm -rf fallback)."""
     kwargs = {"onexc": _on_rm_error} if sys.version_info >= (3, 12) else {"onerror": _on_rm_error}
-    shutil.rmtree(path, **kwargs)
+    try:
+        shutil.rmtree(path, **kwargs)
+    except PermissionError:
+        if not _docker_wipe(path):
+            raise
 
 
 def cmd_clean(force: bool = False, safe: bool = False) -> None:
