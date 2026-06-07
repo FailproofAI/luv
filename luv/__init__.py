@@ -3,6 +3,7 @@ import os
 import random
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -399,6 +400,23 @@ def launch(clone_dir: Path, prompt: str | None, plan_mode: bool = False,
 SAFE_AGE_SECONDS = 24 * 3600
 
 
+def _on_rm_error(func, path, _exc):
+    """rmtree handler: make `path` (and its parent dir) writable, then retry."""
+    parent = os.path.dirname(path)
+    try:
+        os.chmod(parent, os.stat(parent).st_mode | stat.S_IWUSR | stat.S_IXUSR)
+    except OSError:
+        pass
+    os.chmod(path, stat.S_IWUSR | stat.S_IRUSR | stat.S_IXUSR)
+    func(path)
+
+
+def _force_rmtree(path: Path) -> None:
+    """rmtree that chmods read-only files (e.g. uv's CACHEDIR.TAG) instead of crashing."""
+    kwargs = {"onexc": _on_rm_error} if sys.version_info >= (3, 12) else {"onerror": _on_rm_error}
+    shutil.rmtree(path, **kwargs)
+
+
 def cmd_clean(force: bool = False, safe: bool = False) -> None:
     """Scan ~/prs/ and delete fully-pushed, clean work folders."""
     if not PRS_DIR.exists():
@@ -421,7 +439,7 @@ def cmd_clean(force: bool = False, safe: bool = False) -> None:
             if safe and (now - entry.stat().st_mtime) < SAFE_AGE_SECONDS:
                 skipped.append((entry.name, "younger than 24h (--safe)"))
                 continue
-            shutil.rmtree(entry)
+            _force_rmtree(entry)
             cleaned.append(entry.name)
             continue
 
@@ -464,7 +482,7 @@ def cmd_clean(force: bool = False, safe: bool = False) -> None:
             if local_sha != pr_head_sha:
                 skipped.append((entry.name, "local HEAD differs from merged PR head"))
                 continue
-            shutil.rmtree(entry)
+            _force_rmtree(entry)
             cleaned.append(entry.name)
             continue
 
@@ -474,7 +492,7 @@ def cmd_clean(force: bool = False, safe: bool = False) -> None:
             skipped.append((entry.name, "unpushed commits"))
             continue
 
-        shutil.rmtree(entry)
+        _force_rmtree(entry)
         cleaned.append(entry.name)
 
     if skipped:
