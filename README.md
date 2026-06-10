@@ -49,7 +49,7 @@ luv --clean
 1. Clones the repo into `~/prs/{repo}-{number}/`
 2. Creates a new branch `luv-{number}`
 3. Trusts the project in Claude Code config
-4. Launches Claude with Opus and max effort
+4. Launches Claude with Opus 4.8 at max effort; prompt-less sessions auto-run `/effort ultracode` as their first input to enter ultracode mode
 
 All workspaces live under `~/prs/`. The number comes from the repo's GitHub issue counter to avoid collisions.
 
@@ -74,7 +74,7 @@ All workspaces live under `~/prs/`. The number comes from the repo's GitHub issu
 | `-r` | Resume: resume the last Claude session |
 | `-p` | Launch Claude in plan permission mode (default: `bypassPermissions`) |
 | `-nit` | Non-interactive: run `claude -p <prompt>` and exit (no REPL); streams `stream-json` events to stdout |
-| `-m MODEL` | Claude model to use (default: `claude-opus-4-7`); passed through to `claude --model`, so aliases like `opus`/`sonnet`/`haiku` work |
+| `-m MODEL` | Claude model to use (default: `claude-opus-4-8`); passed through to `claude --model`, so aliases like `opus`/`sonnet`/`haiku` work |
 | `-e` | Env: pass `LUV_*` environment variables (with prefix stripped) into the session |
 | `-f`, `--force` | Skip safety checks (with `--clean`) |
 | `--safe` | With `--clean -f`, only delete workspaces older than 24h (mtime) |
