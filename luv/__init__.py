@@ -1,6 +1,5 @@
 import json
 import os
-import random
 import re
 import shutil
 import stat
@@ -15,13 +14,6 @@ CONFIG_FILE = LUV_DIR / "config.json"
 PRS_DIR = Path.home() / "prs"
 CLAUDE_JSON = Path.home() / ".claude.json"
 CLAUDE_SETTINGS_JSON = Path.home() / ".claude" / "settings.json"
-
-COLORS = ["red", "blue", "green", "yellow", "purple", "orange", "pink", "cyan", "default"]
-
-
-def pick_color() -> str:
-    """Pick a random /color value so each luv session is visually distinct."""
-    return random.choice(COLORS)
 
 PR_RULES = """
 # Pull Request Management
@@ -318,7 +310,7 @@ def navigate(clone_dir: Path, extra_env: dict[str, str] = {}) -> None:
 
 
 def resume(clone_dir: Path, extra_env: dict[str, str] | None = None,
-           model: str = "claude-opus-4-7") -> None:
+           model: str = "claude-opus-4-8") -> None:
     """Trust, chdir, and exec claude --resume — replacing this process."""
     extra_env = extra_env or {}
     trust_project(clone_dir)
@@ -353,7 +345,7 @@ def resume(clone_dir: Path, extra_env: dict[str, str] | None = None,
 
 def launch(clone_dir: Path, prompt: str | None, plan_mode: bool = False,
            non_interactive: bool = False, extra_env: dict[str, str] | None = None,
-           model: str = "claude-opus-4-7") -> None:
+           model: str = "claude-opus-4-8") -> None:
     """Trust, resolve claude, chdir, and exec — replacing this process."""
     extra_env = extra_env or {}
     trust_project(clone_dir)
@@ -374,10 +366,10 @@ def launch(clone_dir: Path, prompt: str | None, plan_mode: bool = False,
         initial_args = ["-p", prompt]
     elif plan_mode:
         mode_flags = ["--permission-mode", "plan"]
-        initial_args = [prompt] if prompt else [f"/color {pick_color()}"]
+        initial_args = [prompt] if prompt else ["/effort ultracode"]
     else:
         mode_flags = ["--permission-mode", "bypassPermissions"]
-        initial_args = [prompt] if prompt else [f"/color {pick_color()}"]
+        initial_args = [prompt] if prompt else ["/effort ultracode"]
 
     if compose_file:
         project = docker_project_name(clone_dir)
@@ -552,7 +544,7 @@ def find_latest_clone(repo: str) -> Path | None:
     return best
 
 
-def open_existing(org: str, repo: str, number: int, prompt: str | None, nav_mode: bool = False, resume_mode: bool = False, plan_mode: bool = False, non_interactive: bool = False, extra_env: dict[str, str] | None = None, model: str = "claude-opus-4-7") -> None:
+def open_existing(org: str, repo: str, number: int, prompt: str | None, nav_mode: bool = False, resume_mode: bool = False, plan_mode: bool = False, non_interactive: bool = False, extra_env: dict[str, str] | None = None, model: str = "claude-opus-4-8") -> None:
     """Open an existing work folder or remote branch by number."""
     extra_env = extra_env or {}
     clone_dir = PRS_DIR / f"{repo}-{number}"
@@ -596,7 +588,7 @@ def open_existing(org: str, repo: str, number: int, prompt: str | None, nav_mode
         launch(clone_dir, prompt, plan_mode=plan_mode, non_interactive=non_interactive, extra_env=extra_env, model=model)
 
 
-def open_pr(org: str, repo: str, number: int, prompt: str | None, nav_mode: bool = False, resume_mode: bool = False, plan_mode: bool = False, non_interactive: bool = False, extra_env: dict[str, str] | None = None, model: str = "claude-opus-4-7") -> None:
+def open_pr(org: str, repo: str, number: int, prompt: str | None, nav_mode: bool = False, resume_mode: bool = False, plan_mode: bool = False, non_interactive: bool = False, extra_env: dict[str, str] | None = None, model: str = "claude-opus-4-8") -> None:
     """Open any GitHub PR by org/repo/number, cloning if needed."""
     extra_env = extra_env or {}
     clone_dir = PRS_DIR / f"{repo}-{number}"
@@ -651,7 +643,7 @@ def main() -> None:
     env_mode = "-e" in args
 
     # -m takes a value, so extract it before the boolean-flag strip below
-    model = "claude-opus-4-7"
+    model = "claude-opus-4-8"
     if args.count("-m") > 1:
         die("-m may only be provided once")
     if "-m" in args:
@@ -675,7 +667,7 @@ Flags:
   -r            resume: resume the last Claude session in the work folder
   -p            launch Claude in plan permission mode (default: bypassPermissions)
   -nit          non-interactive: run claude -p <prompt> and exit (no REPL)
-  -m MODEL      claude model to use (default: claude-opus-4-7)
+  -m MODEL      claude model to use (default: claude-opus-4-8)
   -e            env: pass LUV_* environment variables (with prefix stripped) into the session
   -f, --force   (with --clean) skip safety checks and delete all work folders
   --safe        (with --clean -f) only delete folders older than 24h
