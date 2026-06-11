@@ -1,5 +1,6 @@
 import json
 import os
+import random
 import re
 import shutil
 import stat
@@ -14,6 +15,13 @@ CONFIG_FILE = LUV_DIR / "config.json"
 PRS_DIR = Path.home() / "prs"
 CLAUDE_JSON = Path.home() / ".claude.json"
 CLAUDE_SETTINGS_JSON = Path.home() / ".claude" / "settings.json"
+
+COLORS = ["red", "blue", "green", "yellow", "purple", "orange", "pink", "cyan", "default"]
+
+
+def pick_color() -> str:
+    """Pick a random /color value so each luv session is visually distinct."""
+    return random.choice(COLORS)
 
 PR_RULES = """
 # Pull Request Management
@@ -366,10 +374,10 @@ def launch(clone_dir: Path, prompt: str | None, plan_mode: bool = False,
         initial_args = ["-p", prompt]
     elif plan_mode:
         mode_flags = ["--permission-mode", "plan"]
-        initial_args = [prompt] if prompt else ["/effort ultracode"]
+        initial_args = [prompt] if prompt else [f"/color {pick_color()}"]
     else:
         mode_flags = ["--permission-mode", "bypassPermissions"]
-        initial_args = [prompt] if prompt else ["/effort ultracode"]
+        initial_args = [prompt] if prompt else [f"/color {pick_color()}"]
 
     if compose_file:
         project = docker_project_name(clone_dir)

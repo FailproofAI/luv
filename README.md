@@ -49,7 +49,7 @@ luv --clean
 1. Clones the repo into `~/prs/{repo}-{number}/`
 2. Creates a new branch `luv-{number}`
 3. Trusts the project in Claude Code config
-4. Launches Claude with Opus 4.8 at max effort; prompt-less sessions auto-run `/effort ultracode` as their first input to enter ultracode mode
+4. Launches Claude with Opus 4.8 at max effort
 
 All workspaces live under `~/prs/`. The number comes from the repo's GitHub issue counter to avoid collisions.
 
