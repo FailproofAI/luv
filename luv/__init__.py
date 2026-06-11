@@ -366,10 +366,10 @@ def launch(clone_dir: Path, prompt: str | None, plan_mode: bool = False,
         initial_args = ["-p", prompt]
     elif plan_mode:
         mode_flags = ["--permission-mode", "plan"]
-        initial_args = [prompt] if prompt else ["/effort ultracode"]
+        initial_args = [prompt] if prompt else []
     else:
         mode_flags = ["--permission-mode", "bypassPermissions"]
-        initial_args = [prompt] if prompt else ["/effort ultracode"]
+        initial_args = [prompt] if prompt else []
 
     if compose_file:
         project = docker_project_name(clone_dir)
