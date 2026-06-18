@@ -663,6 +663,19 @@ def main() -> None:
             die("-m requires a model name")
         args = args[:idx] + args[idx + 2:]
 
+    # -b takes a value (base branch); extract before the boolean-flag strip below.
+    base = None
+    if args.count("-b") > 1:
+        die("-b may only be provided once")
+    if "-b" in args:
+        idx = args.index("-b")
+        if idx + 1 >= len(args):
+            die("-b requires a branch name")
+        base = args[idx + 1].strip()
+        if not base or base.startswith("-"):
+            die("-b requires a branch name")
+        args = args[:idx] + args[idx + 2:]
+
     args = [a for a in args if a not in ("-n", "-r", "-e", "-f", "--force", "-p", "-nit", "--safe")]
     extra_env = collect_luv_env() if env_mode else {}
 
@@ -676,6 +689,7 @@ Flags:
   -p            launch Claude in plan permission mode (default: bypassPermissions)
   -nit          non-interactive: run claude -p <prompt> and exit (no REPL)
   -m MODEL      claude model to use (default: claude-opus-4-8)
+  -b BRANCH     base a new workspace off BRANCH (clone + branch from it; recorded in git config luv.base)
   -e            env: pass LUV_* environment variables (with prefix stripped) into the session
   -f, --force   (with --clean) skip safety checks and delete all work folders
   --safe        (with --clean -f) only delete folders older than 24h
@@ -683,6 +697,7 @@ Flags:
 Commands:
   luv --init                              configure default GitHub org
   luv [org/]<repo> [prompt...]            create a new PR workspace
+  luv [org/]<repo> -b <branch> [prompt]   create a workspace based off <branch>
   luv [org/]<repo> <number> [prompt]      reopen an existing work folder by number
   luv -l <PR URL> [prompt]                open any GitHub PR by URL
   luv [org/]<repo> -pr <number> [prompt]  open a GitHub PR by repo + number
@@ -702,6 +717,19 @@ Docker:
 
     if safe and (args[0] != "--clean" or not force):
         die("--safe only works with --clean -f")
+
+    # -b only makes sense when creating a NEW workspace; reject it on every path
+    # that early-returns without cloning+branching from scratch.
+    if base is not None:
+        is_reopen_by_number = len(args) > 1 and args[1].isdigit()
+        opens_latest_local = (nav_mode or resume_mode) and len(args) == 1
+        if (args[0] in ("--clean", "--init", "-l")
+                or "-pr" in args
+                or is_reopen_by_number
+                or opens_latest_local):
+            die("-b only applies when creating a new workspace "
+                "(luv [org/]<repo> [prompt...]); it cannot be combined with "
+                "--clean, --init, -l, -pr, reopen-by-number, or bare -n/-r")
 
     if args[0] == "--clean":
         cmd_clean(force=force, safe=safe)
@@ -771,6 +799,14 @@ Docker:
     if r.returncode != 0:
         die(f"repo '{org}/{repo}' not found or gh auth failed.\n{r.stderr.strip()}")
 
+    clone_url = f"https://github.com/{org}/{repo}"
+
+    # 1b. If a base branch was requested, verify it exists before cloning.
+    if base is not None:
+        r = run(["git", "ls-remote", "--heads", clone_url, base])
+        if r.returncode != 0 or f"refs/heads/{base}" not in r.stdout:
+            die(f"base branch '{base}' not found on {org}/{repo}")
+
     # 2. Get latest issue/PR number (shared counter on GitHub).
     # /issues is documented to include PRs but in practice returns [] for repos
     # with no plain issues, so query both endpoints and take the max.
@@ -791,19 +827,29 @@ Docker:
         candidate += 1
     clone_dir = PRS_DIR / f"{repo}-{candidate}"
 
-    # 4. Clone
-    clone_url = f"https://github.com/{org}/{repo}"
-    print(f"luv: cloning {clone_url} -> {clone_dir}")
-    r = subprocess.run(["git", "clone", clone_url, str(clone_dir)])
+    # 4. Clone (off the base branch when -b was given)
+    print(f"luv: cloning {clone_url} -> {clone_dir}" + (f" (base {base})" if base else ""))
+    clone_cmd = ["git", "clone"]
+    if base is not None:
+        clone_cmd += ["--branch", base]
+    clone_cmd += [clone_url, str(clone_dir)]
+    r = subprocess.run(clone_cmd)
     if r.returncode != 0:
         die(f"git clone failed (exit {r.returncode})")
 
-    # 5. Create branch
+    # 5. Create branch off the cloned HEAD (= base when -b was given, else default)
     branch = f"luv-{candidate}"
     print(f"luv: creating branch {branch}")
     r = subprocess.run(["git", "checkout", "-b", branch], cwd=str(clone_dir))
     if r.returncode != 0:
         die(f"git checkout -b failed (exit {r.returncode})")
+
+    # 5b. Record the base so the eventual PR can target it (local .git/config only).
+    if base is not None:
+        r = run(["git", "config", "luv.base", base], cwd=str(clone_dir))
+        if r.returncode != 0:
+            print(f"luv: warning: could not record base branch ({r.stderr.strip()})",
+                  file=sys.stderr)
 
     # 6. Ensure PR rules in ~/.claude/CLAUDE.md and bypass-permissions default
     ensure_pr_rules()
