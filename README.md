@@ -25,6 +25,9 @@ luv --init
 # Create a new workspace and launch Claude
 luv my-repo "add user authentication"
 
+# Base a new workspace off a non-default branch
+luv my-repo -b develop "add user authentication"
+
 # Use a different org inline
 luv other-org/my-repo "fix the bug"
 
@@ -59,6 +62,7 @@ All workspaces live under `~/prs/`. The number comes from the repo's GitHub issu
 |---------|-------------|
 | `luv --init` | Configure default GitHub org |
 | `luv [org/]<repo> [prompt...]` | Create a new workspace and launch Claude |
+| `luv [org/]<repo> -b <branch> [prompt...]` | Create a workspace based off `<branch>` instead of the default |
 | `luv [org/]<repo> <number> [prompt]` | Reopen an existing workspace |
 | `luv -l <PR URL> [prompt]` | Open any GitHub PR by URL |
 | `luv [org/]<repo> -pr <number> [prompt]` | Open a PR by repo + number |
@@ -75,6 +79,7 @@ All workspaces live under `~/prs/`. The number comes from the repo's GitHub issu
 | `-p` | Launch Claude in plan permission mode (default: `bypassPermissions`) |
 | `-nit` | Non-interactive: run `claude -p <prompt>` and exit (no REPL); streams `stream-json` events to stdout |
 | `-m MODEL` | Claude model to use (default: `claude-opus-4-8`); passed through to `claude --model`, so aliases like `opus`/`sonnet`/`haiku` work |
+| `-b BRANCH` | Base a new workspace off `BRANCH` (clone + branch from it); recorded in `git config luv.base` so the PR can target it |
 | `-e` | Env: pass `LUV_*` environment variables (with prefix stripped) into the session |
 | `-f`, `--force` | Skip safety checks (with `--clean`) |
 | `--safe` | With `--clean -f`, only delete workspaces older than 24h (mtime) |
