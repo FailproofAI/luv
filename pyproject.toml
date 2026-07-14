@@ -4,13 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "luv-cli"
-version = "0.0.23"
-description = "Launch Claude Code agents on GitHub repos with isolated workspaces and optional Docker dev environments"
+version = "0.0.24"
+description = "Launch Claude Code or Codex agents on GitHub repos with isolated workspaces and optional Docker dev environments"
 requires-python = ">=3.10"
 license = "MIT"
 dependencies = []
 readme = "README.md"
-keywords = ["claude", "cli", "github", "ai", "agent", "docker"]
+keywords = ["claude", "codex", "cli", "github", "ai", "agent", "docker"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Environment :: Console",

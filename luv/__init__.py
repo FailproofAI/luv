@@ -15,6 +15,7 @@ CONFIG_FILE = LUV_DIR / "config.json"
 PRS_DIR = Path.home() / "prs"
 CLAUDE_JSON = Path.home() / ".claude.json"
 CLAUDE_SETTINGS_JSON = Path.home() / ".claude" / "settings.json"
+CODEX_AGENTS_MD = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "AGENTS.md"
 
 COLORS = ["red", "blue", "green", "yellow", "purple", "orange", "pink", "cyan", "default"]
 
@@ -147,13 +148,14 @@ def docker_env_flags(env_vars: dict[str, str]) -> list[str]:
     return flags
 
 
-def ensure_pr_rules() -> None:
-    claude_dir = Path.home() / ".claude"
-    claude_md = claude_dir / "CLAUDE.md"
-    claude_dir.mkdir(parents=True, exist_ok=True)
-    existing = claude_md.read_text() if claude_md.exists() else ""
+def ensure_pr_rules(agent: str = "claude") -> None:
+    """Install the workspace/PR convention for the selected agent."""
+    instructions_file = (Path.home() / ".claude" / "CLAUDE.md"
+                         if agent == "claude" else CODEX_AGENTS_MD)
+    instructions_file.parent.mkdir(parents=True, exist_ok=True)
+    existing = instructions_file.read_text() if instructions_file.exists() else ""
     if "# Pull Request Management" not in existing:
-        with claude_md.open("a") as f:
+        with instructions_file.open("a") as f:
             f.write(PR_RULES)
 
 
@@ -318,83 +320,106 @@ def navigate(clone_dir: Path, extra_env: dict[str, str] = {}) -> None:
 
 
 def resume(clone_dir: Path, extra_env: dict[str, str] | None = None,
-           model: str = "claude-opus-4-8") -> None:
-    """Trust, chdir, and exec claude --resume — replacing this process."""
+           model: str | None = None, agent: str = "claude") -> None:
+    """Chdir and resume the selected agent, replacing this process."""
     extra_env = extra_env or {}
-    trust_project(clone_dir)
+    if agent == "claude":
+        trust_project(clone_dir)
     os.chdir(str(clone_dir))
     settings = load_luv_settings(clone_dir)
     compose_file = (settings or {}).get("compose_file")
+
+    if agent == "claude":
+        agent_cmd = ["claude", "--dangerously-skip-permissions",
+                     "--model", model or "claude-opus-4-8",
+                     "--effort", "max", "--resume",
+                     "--remote-control",
+                     "--remote-control-session-name-prefix", clone_dir.name]
+    else:
+        agent_cmd = ["codex", "resume", "--last",
+                     "--dangerously-bypass-approvals-and-sandbox"]
+        if model:
+            agent_cmd += ["--model", model]
 
     if compose_file:
         project = docker_project_name(clone_dir)
         start_docker(clone_dir, compose_file, project)
         try:
             base = docker_compose_base(clone_dir, compose_file, project)
-            r = subprocess.run(base + ["exec", "-it"] + docker_env_flags(extra_env) + ["dev-environment",
-                                       "claude", "--dangerously-skip-permissions",
-                                       "--model", model,
-                                       "--effort", "max", "--resume",
-                                       "--remote-control",
-                                       "--remote-control-session-name-prefix", clone_dir.name])
+            r = subprocess.run(base + ["exec", "-it"] + docker_env_flags(extra_env)
+                               + ["dev-environment"] + agent_cmd)
             sys.exit(r.returncode)
         finally:
             stop_docker(clone_dir, compose_file, project)
     else:
-        claude_bin = shutil.which("claude")
-        if not claude_bin:
-            die("'claude' not found in PATH")
+        agent_bin = shutil.which(agent)
+        if not agent_bin:
+            die(f"'{agent}' not found in PATH")
         os.environ.update(extra_env)
-        os.execv(claude_bin, [claude_bin, "--dangerously-skip-permissions",
-                              "--model", model, "--effort", "max", "--resume",
-                              "--remote-control",
-                              "--remote-control-session-name-prefix", clone_dir.name])
+        os.execv(agent_bin, [agent_bin] + agent_cmd[1:])
 
 
 def launch(clone_dir: Path, prompt: str | None, plan_mode: bool = False,
            non_interactive: bool = False, extra_env: dict[str, str] | None = None,
-           model: str = "claude-opus-4-8") -> None:
-    """Trust, resolve claude, chdir, and exec — replacing this process."""
+           model: str | None = None, agent: str = "claude") -> None:
+    """Resolve and launch the selected agent, replacing this process."""
     extra_env = extra_env or {}
-    trust_project(clone_dir)
+    if agent == "claude":
+        trust_project(clone_dir)
     os.chdir(str(clone_dir))
     settings = load_luv_settings(clone_dir)
     compose_file = (settings or {}).get("compose_file")
 
-    common_flags = ["--dangerously-skip-permissions",
-                    "--model", model,
+    if agent == "codex":
+        if plan_mode:
+            die("-p is only supported with Claude")
+        agent_cmd = ["codex"]
+        if non_interactive:
+            if not prompt:
+                die("-nit requires a prompt")
+            agent_cmd += ["exec", "--dangerously-bypass-approvals-and-sandbox"]
+        else:
+            agent_cmd += ["--dangerously-bypass-approvals-and-sandbox"]
+        if model:
+            agent_cmd += ["--model", model]
+        if prompt:
+            agent_cmd.append(prompt)
+    else:
+        common_flags = ["--dangerously-skip-permissions",
+                    "--model", model or "claude-opus-4-8",
                     "--effort", "max",
                     "--remote-control",
                     "--remote-control-session-name-prefix", clone_dir.name]
-    if non_interactive:
-        if not prompt:
-            die("-nit requires a prompt")
-        mode_flags = ["--output-format", "stream-json",
-                      "--verbose", "--include-partial-messages"]
-        initial_args = ["-p", prompt]
-    elif plan_mode:
-        mode_flags = ["--permission-mode", "plan"]
-        initial_args = [prompt] if prompt else [f"/color {pick_color()}"]
-    else:
-        mode_flags = ["--permission-mode", "bypassPermissions"]
-        initial_args = [prompt] if prompt else [f"/color {pick_color()}"]
+        if non_interactive:
+            if not prompt:
+                die("-nit requires a prompt")
+            mode_flags = ["--output-format", "stream-json",
+                          "--verbose", "--include-partial-messages"]
+            initial_args = ["-p", prompt]
+        elif plan_mode:
+            mode_flags = ["--permission-mode", "plan"]
+            initial_args = [prompt] if prompt else [f"/color {pick_color()}"]
+        else:
+            mode_flags = ["--permission-mode", "bypassPermissions"]
+            initial_args = [prompt] if prompt else [f"/color {pick_color()}"]
+        agent_cmd = ["claude"] + common_flags + mode_flags + initial_args
 
     if compose_file:
         project = docker_project_name(clone_dir)
         start_docker(clone_dir, compose_file, project)
         try:
             base = docker_compose_base(clone_dir, compose_file, project)
-            claude_cmd = ["claude"] + common_flags + mode_flags + initial_args
-            r = subprocess.run(base + ["exec", "-it"] + docker_env_flags(extra_env) + ["dev-environment"] + claude_cmd)
+            r = subprocess.run(base + ["exec", "-it"] + docker_env_flags(extra_env)
+                               + ["dev-environment"] + agent_cmd)
             sys.exit(r.returncode)
         finally:
             stop_docker(clone_dir, compose_file, project)
     else:
-        claude_bin = shutil.which("claude")
-        if not claude_bin:
-            die("'claude' not found in PATH")
+        agent_bin = shutil.which(agent)
+        if not agent_bin:
+            die(f"'{agent}' not found in PATH")
         os.environ.update(extra_env)
-        os.execv(claude_bin, [claude_bin] + common_flags + mode_flags + initial_args)
+        os.execv(agent_bin, [agent_bin] + agent_cmd[1:])
 
 
 SAFE_AGE_SECONDS = 24 * 3600
@@ -552,7 +577,7 @@ def find_latest_clone(repo: str) -> Path | None:
     return best
 
 
-def open_existing(org: str, repo: str, number: int, prompt: str | None, nav_mode: bool = False, resume_mode: bool = False, plan_mode: bool = False, non_interactive: bool = False, extra_env: dict[str, str] | None = None, model: str = "claude-opus-4-8") -> None:
+def open_existing(org: str, repo: str, number: int, prompt: str | None, nav_mode: bool = False, resume_mode: bool = False, plan_mode: bool = False, non_interactive: bool = False, extra_env: dict[str, str] | None = None, model: str | None = None, agent: str = "claude") -> None:
     """Open an existing work folder or remote branch by number."""
     extra_env = extra_env or {}
     clone_dir = PRS_DIR / f"{repo}-{number}"
@@ -560,13 +585,13 @@ def open_existing(org: str, repo: str, number: int, prompt: str | None, nav_mode
     # 1. Local folder takes priority
     if clone_dir.exists():
         print(f"luv: opening existing folder {clone_dir.name}")
-        ensure_pr_rules()
+        ensure_pr_rules(agent)
         if nav_mode:
             navigate(clone_dir, extra_env=extra_env)
         elif resume_mode:
-            resume(clone_dir, extra_env=extra_env, model=model)
+            resume(clone_dir, extra_env=extra_env, model=model, agent=agent)
         else:
-            launch(clone_dir, prompt, plan_mode=plan_mode, non_interactive=non_interactive, extra_env=extra_env, model=model)
+            launch(clone_dir, prompt, plan_mode=plan_mode, non_interactive=non_interactive, extra_env=extra_env, model=model, agent=agent)
         return  # unreachable
 
     # 2. Check remote branch luv-{number}
@@ -587,29 +612,29 @@ def open_existing(org: str, repo: str, number: int, prompt: str | None, nav_mode
         die(f"git checkout {branch} failed (exit {r.returncode})")
 
     print(f"luv: ready — {clone_dir.name}, branch {branch}")
-    ensure_pr_rules()
+    ensure_pr_rules(agent)
     if nav_mode:
         navigate(clone_dir, extra_env=extra_env)
     elif resume_mode:
-        resume(clone_dir, extra_env=extra_env, model=model)
+        resume(clone_dir, extra_env=extra_env, model=model, agent=agent)
     else:
-        launch(clone_dir, prompt, plan_mode=plan_mode, non_interactive=non_interactive, extra_env=extra_env, model=model)
+        launch(clone_dir, prompt, plan_mode=plan_mode, non_interactive=non_interactive, extra_env=extra_env, model=model, agent=agent)
 
 
-def open_pr(org: str, repo: str, number: int, prompt: str | None, nav_mode: bool = False, resume_mode: bool = False, plan_mode: bool = False, non_interactive: bool = False, extra_env: dict[str, str] | None = None, model: str = "claude-opus-4-8") -> None:
+def open_pr(org: str, repo: str, number: int, prompt: str | None, nav_mode: bool = False, resume_mode: bool = False, plan_mode: bool = False, non_interactive: bool = False, extra_env: dict[str, str] | None = None, model: str | None = None, agent: str = "claude") -> None:
     """Open any GitHub PR by org/repo/number, cloning if needed."""
     extra_env = extra_env or {}
     clone_dir = PRS_DIR / f"{repo}-{number}"
 
     if clone_dir.exists():
         print(f"luv: opening existing folder {clone_dir.name}")
-        ensure_pr_rules()
+        ensure_pr_rules(agent)
         if nav_mode:
             navigate(clone_dir, extra_env=extra_env)
         elif resume_mode:
-            resume(clone_dir, extra_env=extra_env, model=model)
+            resume(clone_dir, extra_env=extra_env, model=model, agent=agent)
         else:
-            launch(clone_dir, prompt, plan_mode=plan_mode, non_interactive=non_interactive, extra_env=extra_env, model=model)
+            launch(clone_dir, prompt, plan_mode=plan_mode, non_interactive=non_interactive, extra_env=extra_env, model=model, agent=agent)
         return  # unreachable
 
     # Resolve the actual branch name via GitHub API
@@ -630,13 +655,13 @@ def open_pr(org: str, repo: str, number: int, prompt: str | None, nav_mode: bool
         die(f"git checkout {branch} failed (exit {r.returncode})")
 
     print(f"luv: ready — {clone_dir.name}, branch {branch}")
-    ensure_pr_rules()
+    ensure_pr_rules(agent)
     if nav_mode:
         navigate(clone_dir, extra_env=extra_env)
     elif resume_mode:
-        resume(clone_dir, extra_env=extra_env, model=model)
+        resume(clone_dir, extra_env=extra_env, model=model, agent=agent)
     else:
-        launch(clone_dir, prompt, plan_mode=plan_mode, non_interactive=non_interactive, extra_env=extra_env, model=model)
+        launch(clone_dir, prompt, plan_mode=plan_mode, non_interactive=non_interactive, extra_env=extra_env, model=model, agent=agent)
 
 
 def main() -> None:
@@ -650,8 +675,14 @@ def main() -> None:
     safe = "--safe" in args
     env_mode = "-e" in args
 
+    if "--claude" in args and "--codex" in args:
+        die("--claude and --codex are mutually exclusive")
+    agent = "codex" if "--codex" in args else "claude"
+    if agent == "codex" and plan_mode:
+        die("-p is only supported with Claude")
+
     # -m takes a value, so extract it before the boolean-flag strip below
-    model = "claude-opus-4-8"
+    model = None
     if args.count("-m") > 1:
         die("-m may only be provided once")
     if "-m" in args:
@@ -676,7 +707,7 @@ def main() -> None:
             die("-b requires a branch name")
         args = args[:idx] + args[idx + 2:]
 
-    args = [a for a in args if a not in ("-n", "-r", "-e", "-f", "--force", "-p", "-nit", "--safe")]
+    args = [a for a in args if a not in ("-n", "-r", "-e", "-f", "--force", "-p", "-nit", "--safe", "--claude", "--codex")]
     extra_env = collect_luv_env() if env_mode else {}
 
     if not args or args[0] in ("-h", "--help"):
@@ -684,11 +715,13 @@ def main() -> None:
 Usage: luv [flags] <command>
 
 Flags:
-  -n            navigate: open a shell in the work folder instead of launching Claude
-  -r            resume: resume the last Claude session in the work folder
+  --claude      launch Claude Code (default)
+  --codex       launch Codex in YOLO mode (no approvals or sandbox)
+  -n            navigate: open a shell instead of launching an agent
+  -r            resume: resume the selected agent's last session
   -p            launch Claude in plan permission mode (default: bypassPermissions)
-  -nit          non-interactive: run claude -p <prompt> and exit (no REPL)
-  -m MODEL      claude model to use (default: claude-opus-4-8)
+  -nit          non-interactive: run the selected agent and exit (no REPL)
+  -m MODEL      model to use (Claude default: claude-opus-4-8; Codex: CLI default)
   -b BRANCH     base a new workspace off BRANCH (clone + branch from it; recorded in git config luv.base)
   -e            env: pass LUV_* environment variables (with prefix stripped) into the session
   -f, --force   (with --clean) skip safety checks and delete all work folders
@@ -702,7 +735,7 @@ Commands:
   luv -l <PR URL> [prompt]                open any GitHub PR by URL
   luv [org/]<repo> -pr <number> [prompt]  open a GitHub PR by repo + number
   luv [org/]<repo> -n                     open shell in latest local clone
-  luv [org/]<repo> -r                     resume Claude in latest local clone
+  luv [org/]<repo> -r                     resume the selected agent in latest local clone
   luv --clean [-f] [--safe]               delete fully-pushed work folders
 
 Org resolution:
@@ -711,7 +744,7 @@ Org resolution:
 
 Docker:
   If the repo contains .luv/settings.json with a "compose_file" key,
-  luv starts a Docker Compose environment and runs Claude inside the
+  luv starts a Docker Compose environment and runs the selected agent inside the
   "dev-environment" service. Torn down automatically on exit.""")
         sys.exit(0)
 
@@ -749,7 +782,7 @@ Docker:
             die(f"cannot parse PR URL: {url}")
         org, repo, number = m.group(1), m.group(2), int(m.group(3))
         prompt = " ".join(args[2:]) or None
-        open_pr(org, repo, number, prompt, nav_mode, resume_mode, plan_mode, non_interactive, extra_env=extra_env, model=model)
+        open_pr(org, repo, number, prompt, nav_mode, resume_mode, plan_mode, non_interactive, extra_env=extra_env, model=model, agent=agent)
         return
 
     raw = args[0].rstrip("/")
@@ -769,14 +802,14 @@ Docker:
             die(f"expected a PR number after -pr, got '{args[idx + 1]}'")
         prompt_parts = [a for i, a in enumerate(args) if i not in (0, idx, idx + 1)]
         prompt = " ".join(prompt_parts) or None
-        open_pr(resolve_org(explicit_org), repo, number, prompt, nav_mode, resume_mode, plan_mode, non_interactive, extra_env=extra_env, model=model)
+        open_pr(resolve_org(explicit_org), repo, number, prompt, nav_mode, resume_mode, plan_mode, non_interactive, extra_env=extra_env, model=model, agent=agent)
         return
 
     # Detect optional numeric second argument
     if len(args) > 1 and args[1].isdigit():
         number = int(args[1])
         prompt = " ".join(args[2:]) or None
-        open_existing(resolve_org(explicit_org), repo, number, prompt, nav_mode, resume_mode, plan_mode, non_interactive, extra_env=extra_env, model=model)
+        open_existing(resolve_org(explicit_org), repo, number, prompt, nav_mode, resume_mode, plan_mode, non_interactive, extra_env=extra_env, model=model, agent=agent)
         return
 
     org = resolve_org(explicit_org)
@@ -791,7 +824,8 @@ Docker:
         if nav_mode:
             navigate(clone_dir, extra_env=extra_env)
         else:
-            resume(clone_dir, extra_env=extra_env, model=model)
+            ensure_pr_rules(agent)
+            resume(clone_dir, extra_env=extra_env, model=model, agent=agent)
         return
 
     # 1. Verify repo exists
@@ -852,8 +886,9 @@ Docker:
                   file=sys.stderr)
 
     # 6. Ensure PR rules in ~/.claude/CLAUDE.md and bypass-permissions default
-    ensure_pr_rules()
-    ensure_default_permission_mode()
+    ensure_pr_rules(agent)
+    if agent == "claude":
+        ensure_default_permission_mode()
 
     print(f"luv: ready — {clone_dir.name}, branch {branch}")
 
@@ -861,6 +896,6 @@ Docker:
     if nav_mode:
         navigate(clone_dir, extra_env=extra_env)
     elif resume_mode:
-        resume(clone_dir, extra_env=extra_env, model=model)
+        resume(clone_dir, extra_env=extra_env, model=model, agent=agent)
     else:
-        launch(clone_dir, prompt, plan_mode=plan_mode, non_interactive=non_interactive, extra_env=extra_env, model=model)
+        launch(clone_dir, prompt, plan_mode=plan_mode, non_interactive=non_interactive, extra_env=extra_env, model=model, agent=agent)

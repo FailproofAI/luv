@@ -1,6 +1,6 @@
 # luv
 
-A CLI that launches [Claude Code](https://docs.anthropic.com/en/docs/claude-code) agents on GitHub repos with isolated workspaces and optional Docker dev environments.
+A CLI that launches Claude Code or Codex agents on GitHub repos with isolated workspaces and optional Docker dev environments.
 
 `luv` clones a repo, creates a branch, and drops you into a Claude session ready to work. When the repo ships a `.luv/settings.json`, it spins up Docker Compose automatically so every command runs in the right environment.
 
@@ -14,7 +14,7 @@ uv tool install luv-cli
 pip install luv-cli
 ```
 
-**Requirements:** [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI and [GitHub CLI](https://cli.github.com/) (`gh`) must be installed and authenticated.
+**Requirements:** [GitHub CLI](https://cli.github.com/) (`gh`) plus either Claude Code or Codex must be installed and authenticated.
 
 ## Quick start
 
@@ -24,6 +24,12 @@ luv --init
 
 # Create a new workspace and launch Claude
 luv my-repo "add user authentication"
+
+# Launch Codex in YOLO mode instead
+luv --codex my-repo "add user authentication"
+
+# Select Claude explicitly (Claude remains the default)
+luv --claude my-repo "add user authentication"
 
 # Base a new workspace off a non-default branch
 luv my-repo -b develop "add user authentication"
@@ -51,8 +57,8 @@ luv --clean
 
 1. Clones the repo into `~/prs/{repo}-{number}/`
 2. Creates a new branch `luv-{number}`
-3. Trusts the project in Claude Code config
-4. Launches Claude with Opus 4.8 at max effort
+3. Configures the selected agent with the workspace's PR conventions
+4. Launches Claude with Opus 4.8 at max effort, or Codex in YOLO mode
 
 All workspaces live under `~/prs/`. The number comes from the repo's GitHub issue counter to avoid collisions.
 
@@ -61,7 +67,8 @@ All workspaces live under `~/prs/`. The number comes from the repo's GitHub issu
 | Command | Description |
 |---------|-------------|
 | `luv --init` | Configure default GitHub org |
-| `luv [org/]<repo> [prompt...]` | Create a new workspace and launch Claude |
+| `luv [org/]<repo> [prompt...]` | Create a new workspace and launch Claude (default) |
+| `luv --codex [org/]<repo> [prompt...]` | Create a workspace and launch Codex in YOLO mode |
 | `luv [org/]<repo> -b <branch> [prompt...]` | Create a workspace based off `<branch>` instead of the default |
 | `luv [org/]<repo> <number> [prompt]` | Reopen an existing workspace |
 | `luv -l <PR URL> [prompt]` | Open any GitHub PR by URL |
@@ -74,11 +81,13 @@ All workspaces live under `~/prs/`. The number comes from the repo's GitHub issu
 
 | Flag | Description |
 |------|-------------|
+| `--claude` | Launch Claude Code (default) |
+| `--codex` | Launch Codex with approvals and sandboxing bypassed (YOLO mode) |
 | `-n` | Navigate: open a shell instead of Claude |
-| `-r` | Resume: resume the last Claude session |
+| `-r` | Resume: resume the selected agent's last session |
 | `-p` | Launch Claude in plan permission mode (default: `bypassPermissions`) |
-| `-nit` | Non-interactive: run `claude -p <prompt>` and exit (no REPL); streams `stream-json` events to stdout |
-| `-m MODEL` | Claude model to use (default: `claude-opus-4-8`); passed through to `claude --model`, so aliases like `opus`/`sonnet`/`haiku` work |
+| `-nit` | Non-interactive: run the selected agent and exit (no REPL); Claude streams `stream-json` events to stdout |
+| `-m MODEL` | Model to use; Claude defaults to `claude-opus-4-8`, while Codex uses its configured CLI default |
 | `-b BRANCH` | Base a new workspace off `BRANCH` (clone + branch from it); recorded in `git config luv.base` so the PR can target it |
 | `-e` | Env: pass `LUV_*` environment variables (with prefix stripped) into the session |
 | `-f`, `--force` | Skip safety checks (with `--clean`) |
@@ -120,7 +129,7 @@ services:
       POSTGRES_PASSWORD: dev
 ```
 
-The `dev-environment` service **must** have [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed in its image.
+The `dev-environment` service **must** have the selected agent CLI (`claude` or `codex`) installed in its image.
 
 ### How Docker mode works
 
@@ -128,7 +137,7 @@ The `dev-environment` service **must** have [Claude Code](https://docs.anthropic
 2. Tears down any stale environment from a previous run
 3. Starts `docker compose up -d --build` with a unique project name (`luv-{repo}-{number}`) for network/volume isolation
 4. Verifies the `dev-environment` service is running
-5. Runs Claude inside the container via `docker compose exec`
+5. Runs the selected agent inside the container via `docker compose exec`
 6. The repo is volume-mounted, so all file changes and git commits are visible on the host
 7. On exit (including Ctrl-C), tears down the environment with `docker compose down -v`
 
