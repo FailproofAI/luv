@@ -331,7 +331,7 @@ def resume(clone_dir: Path, extra_env: dict[str, str] | None = None,
 
     if agent == "claude":
         agent_cmd = ["claude", "--dangerously-skip-permissions",
-                     "--model", model or "claude-opus-4-8",
+                     "--model", model or "claude-opus-5",
                      "--effort", "max", "--resume",
                      "--remote-control",
                      "--remote-control-session-name-prefix", clone_dir.name]
@@ -386,7 +386,7 @@ def launch(clone_dir: Path, prompt: str | None, plan_mode: bool = False,
             agent_cmd.append(prompt)
     else:
         common_flags = ["--dangerously-skip-permissions",
-                    "--model", model or "claude-opus-4-8",
+                    "--model", model or "claude-opus-5",
                     "--effort", "max",
                     "--remote-control",
                     "--remote-control-session-name-prefix", clone_dir.name]
@@ -721,7 +721,7 @@ Flags:
   -r            resume: resume the selected agent's last session
   -p            launch Claude in plan permission mode (default: bypassPermissions)
   -nit          non-interactive: run the selected agent and exit (no REPL)
-  -m MODEL      model to use (Claude default: claude-opus-4-8; Codex: CLI default)
+  -m MODEL      model to use (Claude default: claude-opus-5; Codex: CLI default)
   -b BRANCH     base a new workspace off BRANCH (clone + branch from it; recorded in git config luv.base)
   -e            env: pass LUV_* environment variables (with prefix stripped) into the session
   -f, --force   (with --clean) skip safety checks and delete all work folders

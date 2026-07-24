@@ -59,7 +59,7 @@ class AgentLaunchTests(unittest.TestCase):
         _, argv = self._exec_args(luv.launch, self.clone_dir, None)
 
         self.assertEqual(argv[0], "/bin/claude")
-        self.assertIn("claude-opus-4-8", argv)
+        self.assertIn("claude-opus-5", argv)
         self.assertIn("--dangerously-skip-permissions", argv)
 
     def test_main_routes_codex_to_existing_workspace(self):
