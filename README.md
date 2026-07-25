@@ -58,7 +58,7 @@ luv --clean
 1. Clones the repo into `~/prs/{repo}-{number}/`
 2. Creates a new branch `luv-{number}`
 3. Configures the selected agent with the workspace's PR conventions
-4. Launches Claude with Opus 4.8 at max effort, or Codex in YOLO mode
+4. Launches Claude with Opus 5 at max effort, or Codex in YOLO mode
 
 All workspaces live under `~/prs/`. The number comes from the repo's GitHub issue counter to avoid collisions.
 
@@ -87,7 +87,7 @@ All workspaces live under `~/prs/`. The number comes from the repo's GitHub issu
 | `-r` | Resume: resume the selected agent's last session |
 | `-p` | Launch Claude in plan permission mode (default: `bypassPermissions`) |
 | `-nit` | Non-interactive: run the selected agent and exit (no REPL); Claude streams `stream-json` events to stdout |
-| `-m MODEL` | Model to use; Claude defaults to `claude-opus-4-8`, while Codex uses its configured CLI default |
+| `-m MODEL` | Model to use; Claude defaults to `claude-opus-5`, while Codex uses its configured CLI default |
 | `-b BRANCH` | Base a new workspace off `BRANCH` (clone + branch from it); recorded in `git config luv.base` so the PR can target it |
 | `-e` | Env: pass `LUV_*` environment variables (with prefix stripped) into the session |
 | `-f`, `--force` | Skip safety checks (with `--clean`) |
