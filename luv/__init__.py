@@ -5,6 +5,7 @@ import random
 import re
 import shlex
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -162,6 +163,94 @@ def ssh_run(hc: dict | None, remote_cmd: str, *, batch: bool = True):
 def tmux_session_name(folder: str) -> str:
     """tmux forbids '.' and ':' in session names; repo names like foo.js don't."""
     return "luv-" + folder.replace(".", "_").replace(":", "_")
+
+
+SLUG_MAX = 8
+
+
+def sanitize_slug(raw: str) -> str:
+    """Lowercase alphanumerics only, capped at SLUG_MAX.
+
+    Dropping separators rather than replacing them is what keeps workspace_re
+    unambiguous: with no '-' inside a slug, '{repo}-{slug}-{number}' has exactly
+    one reading. 'gpu-box-01' collapses to 'gpubox01' rather than 'gpu', so two
+    similarly-named boxes stay distinguishable.
+    """
+    return re.sub(r"[^a-z0-9]", "", raw.lower())[:SLUG_MAX]
+
+
+def machine_slug() -> str:
+    """Short token identifying this machine, for workspace and branch names.
+
+    Workspace numbers come from GitHub's issue counter, which every machine
+    computes independently — so two machines racing on the same repo both pick
+    the same number and would push the same branch. The slug is what keeps them
+    apart. Config wins over the hostname so the name can be something readable.
+    """
+    configured = load_config().get("machine")
+    if isinstance(configured, str) and sanitize_slug(configured):
+        return sanitize_slug(configured)
+    return sanitize_slug(socket.gethostname().split(".")[0]) or "local"
+
+
+def workspace_name(repo: str, number: int, slug: str | None = None) -> str:
+    """Folder name for a workspace: '{repo}-{machine}-{number}'."""
+    return f"{repo}-{slug or machine_slug()}-{number}"
+
+
+def branch_name(number: int, slug: str | None = None) -> str:
+    """Branch luv creates for a new workspace: 'luv-{machine}-{number}'."""
+    return f"luv-{slug or machine_slug()}-{number}"
+
+
+def workspace_re(repo: str) -> re.Pattern:
+    """Match this repo's workspace folders, slugged or legacy.
+
+    The repo name is known at every call site, so it can be anchored — which is
+    what makes the optional middle group unambiguous. Group 1 is the slug (None
+    for a pre-slug folder), group 2 the number.
+    """
+    return re.compile(rf"^{re.escape(repo)}-(?:([a-z0-9]+)-)?(\d+)$")
+
+
+def branch_re(number: int) -> re.Pattern:
+    """Match luv branches for a number, slugged or legacy."""
+    return re.compile(rf"^luv-(?:[a-z0-9]+-)?{number}$")
+
+
+def find_workspace(repo: str, number: int) -> Path | None:
+    """Locate an existing workspace folder for {repo}-{number}, or None.
+
+    Ours first, then one that arrived here by handover (it keeps the slug of the
+    machine that created it), then a pre-slug folder. Two foreign candidates is
+    genuinely ambiguous — the number alone cannot say which was meant.
+    """
+    mine = PRS_DIR / workspace_name(repo, number)
+    if mine.is_dir():
+        return mine
+    if not PRS_DIR.exists():
+        return None
+
+    pattern = workspace_re(repo)
+    foreign, legacy = [], None
+    for entry in sorted(PRS_DIR.iterdir()):
+        if not entry.is_dir():
+            continue
+        m = pattern.match(entry.name)
+        if not m or int(m.group(2)) != number:
+            continue
+        if m.group(1) is None:
+            legacy = entry
+        else:
+            foreign.append(entry)
+
+    if len(foreign) > 1:
+        names = ", ".join(e.name for e in foreign)
+        die(f"ambiguous workspace for '{repo}' {number}: {names}\n"
+            f"       open one by name with 'luv {repo} -n' or remove the stale folder")
+    if foreign:
+        return foreign[0]
+    return legacy
 
 
 TMUX_LIST_CMD = (
@@ -353,18 +442,18 @@ def reconcile(sessions: list[dict],
     return kept, {h for h, v in results.items() if v is None}
 
 
+def parse_github_url(url: str) -> tuple[str, str] | None:
+    """(org, repo) from a GitHub clone URL, in either form. None if neither."""
+    m = re.match(r"https://github\.com/([^/]+)/([^/.]+)", url.strip())
+    if not m:
+        m = re.match(r"git@github\.com:([^/]+)/([^/.]+)", url.strip())
+    return (m.group(1), m.group(2)) if m else None
+
+
 def parse_github_remote(cwd: str) -> tuple[str, str] | None:
     """Extract (org, repo) from origin remote URL. Returns None on failure."""
     r = run(["git", "remote", "get-url", "origin"], cwd=cwd)
-    if r.returncode != 0:
-        return None
-    url = r.stdout.strip()
-    m = re.match(r"https://github\.com/([^/]+)/([^/.]+)", url)
-    if not m:
-        m = re.match(r"git@github\.com:([^/]+)/([^/.]+)", url)
-    if m:
-        return m.group(1), m.group(2)
-    return None
+    return parse_github_url(r.stdout) if r.returncode == 0 else None
 
 
 def resolve_org(explicit: str | None = None) -> str:
@@ -674,6 +763,15 @@ def cmd_config(args: list[str]) -> None:
     if not isinstance(remote, dict):
         remote = {}
 
+    # Asked first because it names every workspace and branch this machine
+    # creates, and the hostname-derived default is rarely the nicest label.
+    slug = input(f"This machine's name, used in workspace and branch names "
+                 f"[{machine_slug()}]: ").strip()
+    if slug:
+        if not sanitize_slug(slug):
+            die(f"'{slug}' has no letters or digits to make a machine name from")
+        config["machine"] = sanitize_slug(slug)
+
     current = remote.get("host") or ""
     host = input(f"Remote host (ssh alias or user@host) [{current or 'none'}]: ").strip()
     if not host:
@@ -951,9 +1049,8 @@ def cmd_clean(force: bool = False, safe: bool = False) -> None:
         if not entry.is_dir():
             continue
 
-        parts = entry.name.rsplit("-", 1)
-        if len(parts) != 2 or not parts[1].isdigit():
-            continue  # doesn't match {repo}-{number} — skip silently
+        if not re.match(r"^.+-\d+$", entry.name):
+            continue  # doesn't look like a luv workspace — skip silently
 
         if tmux_session_name(entry.name) in live:
             skipped.append((entry.name, "live tmux session"))
@@ -967,12 +1064,19 @@ def cmd_clean(force: bool = False, safe: bool = False) -> None:
             cleaned.append(entry.name)
             continue
 
-        number_str = parts[1]
-        branch = f"luv-{number_str}"
         cwd = str(entry)
 
         # Must be a git repo
         if run(["git", "rev-parse", "--git-dir"], cwd=cwd).returncode != 0:
+            continue
+
+        # Ask git for the branch rather than rebuilding it from the folder name:
+        # the name carries the slug of the machine that created the workspace,
+        # which is not this one after a handover.
+        branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                     cwd=cwd).stdout.strip()
+        if not branch or branch == "HEAD":
+            skipped.append((entry.name, "detached HEAD"))
             continue
 
         # 1. Working tree must be clean
@@ -1034,29 +1138,36 @@ def cmd_clean(force: bool = False, safe: bool = False) -> None:
 
 
 def find_latest_clone(repo: str) -> Path | None:
-    """Return the highest-numbered local {repo}-{N} folder, or None."""
+    """Return the highest-numbered local workspace for a repo, or None.
+
+    Slugged and pre-slug folders compete on the number alone; a tie between our
+    own slug and one that arrived by handover goes to ours.
+    """
     if not PRS_DIR.exists():
         return None
+    pattern = workspace_re(repo)
+    mine = machine_slug()
     best: Path | None = None
-    best_num = -1
-    for entry in PRS_DIR.iterdir():
+    best_key = (-1, -1)
+    for entry in sorted(PRS_DIR.iterdir()):
         if not entry.is_dir():
             continue
-        parts = entry.name.rsplit("-", 1)
-        if len(parts) == 2 and parts[0] == repo and parts[1].isdigit():
-            n = int(parts[1])
-            if n > best_num:
-                best, best_num = entry, n
+        m = pattern.match(entry.name)
+        if not m:
+            continue
+        key = (int(m.group(2)), 1 if m.group(1) == mine else 0)
+        if key > best_key:
+            best, best_key = entry, key
     return best
 
 
 def open_existing(org: str, repo: str, number: int, prompt: str | None, nav_mode: bool = False, resume_mode: bool = False, plan_mode: bool = False, non_interactive: bool = False, extra_env: dict[str, str] | None = None, model: str | None = None, agent: str = "claude") -> None:
     """Open an existing work folder or remote branch by number."""
     extra_env = extra_env or {}
-    clone_dir = PRS_DIR / f"{repo}-{number}"
+    clone_dir = find_workspace(repo, number)
 
     # 1. Local folder takes priority
-    if clone_dir.exists():
+    if clone_dir is not None:
         print(f"luv: opening existing folder {clone_dir.name}")
         ensure_pr_rules(agent)
         if nav_mode:
@@ -1067,14 +1178,27 @@ def open_existing(org: str, repo: str, number: int, prompt: str | None, nav_mode
             launch(clone_dir, prompt, plan_mode=plan_mode, non_interactive=non_interactive, extra_env=extra_env, model=model, agent=agent)
         return  # unreachable
 
-    # 2. Check remote branch luv-{number}
-    branch = f"luv-{number}"
+    # 2. Check for a remote luv branch for this number.
+    # The slug belongs to whichever machine created the workspace, so ours is
+    # only the first guess — a branch pushed from another machine is still the
+    # right one to check out here.
     clone_url = f"https://github.com/{org}/{repo}"
-    r = run(["git", "ls-remote", "--heads", clone_url, branch])
-    if branch not in r.stdout:
-        die(f"no local folder '{repo}-{number}' and no remote branch '{branch}'")
+    r = run(["git", "ls-remote", "--heads", clone_url])
+    pattern = branch_re(number)
+    candidates = [line.split("refs/heads/", 1)[1]
+                  for line in r.stdout.splitlines() if "refs/heads/" in line]
+    candidates = [b for b in candidates if pattern.match(b)]
+    if not candidates:
+        die(f"no local folder for '{repo}' {number} "
+            f"and no remote branch matching 'luv-*-{number}'")
+    preferred = [branch_name(number), f"luv-{number}"]
+    branch = next((b for b in preferred if b in candidates), candidates[0])
+    if len(candidates) > 1:
+        print(f"luv: warning: {len(candidates)} branches match "
+              f"({', '.join(candidates)}); using {branch}", file=sys.stderr)
 
     # 3. Clone and checkout the existing branch
+    clone_dir = PRS_DIR / workspace_name(repo, number)
     PRS_DIR.mkdir(parents=True, exist_ok=True)
     print(f"luv: cloning {clone_url} -> {clone_dir} (branch {branch})")
     r = subprocess.run(["git", "clone", clone_url, str(clone_dir)])
@@ -1097,9 +1221,9 @@ def open_existing(org: str, repo: str, number: int, prompt: str | None, nav_mode
 def open_pr(org: str, repo: str, number: int, prompt: str | None, nav_mode: bool = False, resume_mode: bool = False, plan_mode: bool = False, non_interactive: bool = False, extra_env: dict[str, str] | None = None, model: str | None = None, agent: str = "claude") -> None:
     """Open any GitHub PR by org/repo/number, cloning if needed."""
     extra_env = extra_env or {}
-    clone_dir = PRS_DIR / f"{repo}-{number}"
+    clone_dir = find_workspace(repo, number)
 
-    if clone_dir.exists():
+    if clone_dir is not None:
         print(f"luv: opening existing folder {clone_dir.name}")
         ensure_pr_rules(agent)
         if nav_mode:
@@ -1118,6 +1242,7 @@ def open_pr(org: str, repo: str, number: int, prompt: str | None, nav_mode: bool
     branch = pr_data["head"]["ref"]
     clone_url = pr_data["head"]["repo"]["clone_url"]
 
+    clone_dir = PRS_DIR / workspace_name(repo, number)
     PRS_DIR.mkdir(parents=True, exist_ok=True)
     print(f"luv: cloning {clone_url} -> {clone_dir} (branch {branch})")
     r = subprocess.run(["git", "clone", clone_url, str(clone_dir)])
@@ -1181,14 +1306,70 @@ def remote_prompt(args: list[str]) -> str | None:
     return " ".join(args[1:]) or None
 
 
+def registry_workspace(host: str, repo: str, number: int) -> str | None:
+    """Workspace folder recorded for this host/repo/number, if luv knows it."""
+    pattern = workspace_re(repo)
+    for s in load_sessions():
+        if (s.get("host") or "") != host or s.get("repo") != repo:
+            continue
+        name = s.get("workspace")
+        m = pattern.match(name) if isinstance(name, str) else None
+        if m and int(m.group(2)) == number:
+            return name
+    return None
+
+
+def resolve_remote_workspace(hc: dict, org: str | None, repo: str,
+                             number: int) -> str | None:
+    """Folder name the remote uses for {repo}-{number}, or None if unknowable.
+
+    The slug in a workspace name belongs to the machine that created it, so the
+    dispatcher can't compute this — it has to look it up. The registry answers
+    for anything luv has launched; otherwise one cheap ssh asks the host itself.
+    None leaves the caller on the luv-pending path, which renames on arrival.
+    """
+    known = registry_workspace(hc["host"], repo, number)
+    if known:
+        return known
+
+    env = {"_LUV_INNER": "1"}
+    if hc.get("dir"):
+        env["_LUV_PRS_DIR"] = str(hc["dir"])
+    cmd = shlex.join(["env"] + [f"{k}={v}" for k, v in env.items()]
+                     + [str(hc.get("luv_bin") or "luv"), "--where",
+                        f"{org}/{repo}" if org else repo, str(number)])
+    r = ssh_run(hc, cmd)
+    name = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else ""
+    if r.returncode != 0 or not workspace_re(repo).match(name):
+        return None
+    return name
+
+
+def cmd_where(args: list[str]) -> None:
+    """Print the workspace folder name for [org/]<repo> <number>.
+
+    Exists for the dispatcher rather than for people: asking the machine that
+    holds a workspace is the only way to learn which machine's slug it carries.
+    """
+    if len(args) < 2 or not args[1].isdigit():
+        die("usage: luv --where [org/]<repo> <number>")
+    repo = args[0].rstrip("/").rsplit("/", 1)[-1]
+    number = int(args[1])
+    found = find_workspace(repo, number)
+    print(found.name if found else workspace_name(repo, number))
+
+
 def dispatch_remote(hc: dict, remote_args: list[str], *, workspace: str | None = None,
-                    use_tmux: bool = True, tty: bool = True,
+                    use_tmux: bool = True, tty: bool = True, detach: bool = False,
                     meta: dict | None = None, extra_env: dict[str, str] | None = None) -> None:
     """Re-invoke luv on the remote host, inside tmux. Replaces this process.
 
     tmux wraps the *whole* remote invocation, not just the agent, so the clone
     and any docker compose start-up are inside the pane from second zero and a
     dropped connection never loses work.
+
+    With detach=True the session is started in the background and this returns
+    instead of handing over the terminal.
     """
     sid = new_session_id()
     env = {"_LUV_INNER": "1", "_LUV_ID": sid}
@@ -1210,15 +1391,170 @@ def dispatch_remote(hc: dict, remote_args: list[str], *, workspace: str | None =
 
     inner = ["env"] + [f"{k}={v}" for k, v in env.items()]
     inner += [str(hc.get("luv_bin") or "luv")] + remote_args
-    cmd = shlex.join(["tmux", "new-session", "-A", "-s", session, "--"] + inner
-                     if use_tmux else inner)
+    tmux_args = ["tmux", "new-session"] + (["-d"] if detach else []) + \
+                ["-A", "-s", session, "--"]
+    cmd = shlex.join(tmux_args + inner if use_tmux else inner)
 
     if meta is not None:
         record_session({**meta, "id": sid, "host": hc["host"], "session": session,
                         "workspace": workspace, "created": int(time.time())})
 
     print(f"luv: {hc['host']} — {session or 'no tmux'}")
+    if detach:
+        r = run(ssh_base(hc, batch=True) + [remote_shell(cmd)])
+        if r.returncode != 0:
+            die(f"could not start {session} on {hc['host']}: {r.stderr.strip()}")
+        print(f"luv: started detached — 'luv continue' to attach")
+        return
     exec_ssh(hc, cmd, tty=tty)
+
+
+def cmd_paths() -> None:
+    """Print this machine's $HOME and workspace root, one per line.
+
+    For the dispatcher, like --where: handover needs both as absolute paths on
+    both machines, and only a machine can resolve its own config.
+    """
+    print(Path.home())
+    print(PRS_DIR)
+
+
+def host_label(hc: dict | None) -> str:
+    return hc["host"] if hc else "local"
+
+
+def luv_command(hc: dict | None, luv_args: list[str],
+                env: dict[str, str] | None = None) -> str:
+    """A shell command invoking luv on `hc`, with luv's private env vars set."""
+    env = {"_LUV_INNER": "1", **(env or {})}
+    if hc and hc.get("dir"):
+        env["_LUV_PRS_DIR"] = str(hc["dir"])
+    binary = str(hc.get("luv_bin") or "luv") if hc else (shutil.which("luv") or "luv")
+    return shlex.join(["env"] + [f"{k}={v}" for k, v in env.items()]
+                      + [binary] + luv_args)
+
+
+def remote_paths(hc: dict | None) -> tuple[Path, Path]:
+    """($HOME, workspace root) on a host, both absolute."""
+    if hc is None:
+        return Path.home(), PRS_DIR
+    r = ssh_run(hc, luv_command(hc, ["--paths"]))
+    lines = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+    if r.returncode != 0 or len(lines) < 2:
+        die(f"could not read paths from {hc['host']}: "
+            f"{r.stderr.strip() or 'no answer'}")
+    return Path(lines[-2]), Path(lines[-1])
+
+
+def tar_send_argv(hc: dict | None, cwd: Path, members: list[str]) -> list[str]:
+    """argv that writes a tar of `members` to stdout.
+
+    Never a TTY: ssh -t would translate newlines and corrupt the stream.
+    """
+    if hc is None:
+        return ["tar", "-C", str(cwd), "-czf", "-"] + members
+    inner = shlex.join(["tar", "-C", str(cwd), "-czf", "-"] + members)
+    return ssh_base(hc, batch=True) + [remote_shell(inner)]
+
+
+def tar_recv_argv(hc: dict | None, dest: Path) -> list[str]:
+    """argv that unpacks a tar arriving on stdin into `dest`."""
+    if hc is None:
+        dest.mkdir(parents=True, exist_ok=True)
+        return ["tar", "-C", str(dest), "-xzf", "-"]
+    quoted = shlex.quote(str(dest))
+    return ssh_base(hc, batch=True) + [
+        remote_shell(f"mkdir -p {quoted} && tar -C {quoted} -xzf -")]
+
+
+def stream_copy(src_hc: dict | None, src_dir: Path, members: list[str],
+                dst_hc: dict | None, dst_dir: Path) -> None:
+    """Relay a tar stream from one machine to another through this one.
+
+    Going through the laptop means the two machines never need credentials for
+    each other — you already hold keys to both.
+    """
+    if not members:
+        return
+    send = subprocess.Popen(tar_send_argv(src_hc, src_dir, members),
+                            stdout=subprocess.PIPE)
+    recv = subprocess.Popen(tar_recv_argv(dst_hc, dst_dir), stdin=send.stdout)
+    send.stdout.close()  # let the sender see EPIPE if the receiver dies first
+    recv_rc = recv.wait()
+    send_rc = send.wait()
+    if send_rc != 0 or recv_rc != 0:
+        die(f"transfer failed (tar exit {send_rc} sending, {recv_rc} receiving)")
+
+
+def claude_project_slug(path: Path) -> str:
+    """Claude keys transcripts by cwd with non-alphanumerics replaced by '-'."""
+    return re.sub(r"[^A-Za-z0-9]", "-", str(path))
+
+
+def agent_state_members(hc: dict | None, agent: str, ws: Path,
+                        home: Path) -> list[str]:
+    """Transcript paths for a workspace, relative to $HOME.
+
+    Best-effort by nature — it depends on each agent's on-disk layout, so an
+    empty result is reported and tolerated rather than treated as a failure.
+    """
+    if agent == "codex":
+        # Codex has no path-derived directory, so the rollouts have to be found
+        # by the workspace path recorded inside them.
+        r = ssh_run(hc, f"cd {shlex.quote(str(home))} && "
+                        f"grep -rlF {shlex.quote(str(ws))} .codex/sessions "
+                        "--include='rollout-*.jsonl' 2>/dev/null")
+        return [l.strip() for l in r.stdout.splitlines() if l.strip()]
+    member = f".claude/projects/{claude_project_slug(ws)}"
+    r = ssh_run(hc, f"test -d {shlex.quote(str(home / member))}")
+    return [member] if r.returncode == 0 else []
+
+
+def rewrite_script(files_expr: str, old: str, new: str) -> str:
+    """Shell that rewrites one path to another across files.
+
+    Not `sed -i`: GNU and BSD sed disagree about its argument, and the laptop
+    half of a handover is usually a Mac.
+    """
+    if old == new:
+        return "true"
+    return (f'for f in {files_expr}; do [ -f "$f" ] || continue; '
+            f'sed {shlex.quote(f"s|{old}|{new}|g")} "$f" > "$f.luvtmp" '
+            f'&& mv "$f.luvtmp" "$f"; done')
+
+
+def settle_agent_state(hc: dict | None, agent: str, members: list[str],
+                       src_ws: Path, dst_ws: Path, dst_home: Path) -> None:
+    """Put copied transcripts where the destination's agent will look for them.
+
+    Both agents key on the absolute workspace path, and the two machines rarely
+    agree on it — so the files move to the destination's own project directory
+    and the path recorded inside them is rewritten to match.
+    """
+    if agent == "codex":
+        files = " ".join(shlex.quote(str(dst_home / m)) for m in members)
+        # Freshen them so 'codex resume --last' prefers the session that just
+        # arrived over whatever else this machine worked on recently.
+        script = f"{rewrite_script(files, str(src_ws), str(dst_ws))}; touch {files}"
+    else:
+        src_dir = dst_home / ".claude" / "projects" / claude_project_slug(src_ws)
+        dst_dir = dst_home / ".claude" / "projects" / claude_project_slug(dst_ws)
+        s, d = shlex.quote(str(src_dir)), shlex.quote(str(dst_dir))
+        move = (f'if [ {s} != {d} ]; then mkdir -p {d} && mv {s}/* {d}/ '
+                f'2>/dev/null; rmdir {s} 2>/dev/null; fi')
+        script = f'{move}; {rewrite_script(f"{d}/*.jsonl", str(src_ws), str(dst_ws))}'
+    r = ssh_run(hc, script)
+    if r.returncode != 0:
+        print(f"luv: warning: could not finish placing agent state "
+              f"({r.stderr.strip()})", file=sys.stderr)
+
+
+def workspace_git_state(hc: dict | None, ws: Path) -> tuple[str, str]:
+    """(HEAD sha, count of dirty paths) — enough to tell a copy went wrong."""
+    r = ssh_run(hc, f"cd {shlex.quote(str(ws))} && git rev-parse HEAD && "
+                    "git status --porcelain | wc -l")
+    parts = r.stdout.split()
+    return (parts[0], parts[1]) if r.returncode == 0 and len(parts) >= 2 else ("", "")
 
 
 def relative_age(ts: int | None) -> str:
@@ -1300,6 +1636,50 @@ def cmd_ls(args: list[str], identity: str | None = None) -> None:
     print_sessions(rows)
 
 
+def workspace_number(repo: str, folder: str) -> int | None:
+    """The number in a workspace folder name, slugged or not."""
+    m = workspace_re(repo).match(folder or "")
+    return int(m.group(2)) if m else None
+
+
+def filter_sessions(sessions: list[dict],
+                    args: list[str]) -> tuple[list[dict], str]:
+    """Narrow by [<repo> [number]], and describe the filter for error messages.
+
+    The number is matched against the workspace's number rather than the whole
+    folder name, so a workspace that arrived by handover — still carrying the
+    slug of the machine that made it — is found by the number you know it by.
+    """
+    if not args:
+        return sessions, ""
+    repo = args[0].rstrip("/").rsplit("/", 1)[-1]
+    rows = [s for s in sessions if s.get("repo") == repo]
+    label = f" for '{repo}'"
+    if len(args) > 1 and args[1].isdigit():
+        number = int(args[1])
+        label = f" for '{repo}' {number}"
+        rows = [s for s in rows
+                if workspace_number(repo, s.get("workspace") or "") == number]
+    return rows, label
+
+
+def choose_session(rows: list[dict]) -> dict:
+    """Prompt for one of several sessions."""
+    print(f"luv: {len(rows)} live sessions:")
+    print_sessions(rows)
+    print()
+    for i, s in enumerate(rows, 1):
+        print(f"  {i}) {s.get('session')}  ({s.get('host') or 'local'})")
+    raw = input("Choice [1]: ").strip() or "1"
+    try:
+        idx = int(raw)
+    except ValueError:
+        die(f"invalid choice: '{raw}'")
+    if not 1 <= idx <= len(rows):
+        die(f"invalid choice: {idx}")
+    return rows[idx - 1]
+
+
 def cmd_continue(args: list[str], identity: str | None = None) -> None:
     """Attach to a live luv session; picks or prompts when ambiguous."""
     if args and args[0] == "--list":
@@ -1307,41 +1687,217 @@ def cmd_continue(args: list[str], identity: str | None = None) -> None:
         return
 
     sessions, _ = refresh_sessions(identity)
-    live = [s for s in sessions if s.get("live")]
-
-    label = ""
-    if args:
-        repo = args[0].rstrip("/").rsplit("/", 1)[-1]
-        label = f" for '{repo}'"
-        live = [s for s in live if s.get("repo") == repo]
-        if len(args) > 1 and args[1].isdigit():
-            want = f"{repo}-{int(args[1])}"
-            label = f" for '{want}'"
-            live = [s for s in live if s.get("workspace") == want]
+    live, label = filter_sessions([s for s in sessions if s.get("live")], args)
 
     if not live:
         die(f"no live luv sessions{label}")
     live.sort(key=session_sort_key, reverse=True)
 
-    if len(live) == 1 or args:
-        target = live[0]  # an explicit repo means "the newest one for it"
-    else:
-        print(f"luv: {len(live)} live sessions:")
-        print_sessions(live)
-        print()
-        for i, s in enumerate(live, 1):
-            print(f"  {i}) {s.get('session')}  ({s.get('host') or 'local'})")
-        raw = input("Choice [1]: ").strip() or "1"
-        try:
-            idx = int(raw)
-        except ValueError:
-            die(f"invalid choice: '{raw}'")
-        if not 1 <= idx <= len(live):
-            die(f"invalid choice: {idx}")
-        target = live[idx - 1]
+    # An explicit repo means "the newest one for it".
+    target = live[0] if (len(live) == 1 or args) else choose_session(live)
 
     host = target.get("host")
     attach_session(resolve_host(host, identity) if host else None, target["session"])
+
+
+def start_local_session(workspace: str, luv_args: list[str], meta: dict,
+                        attach: bool) -> None:
+    """Start a workspace in tmux on this machine, the way dispatch_remote does
+    on a remote one. _LUV_INNER keeps it here even with a host configured."""
+    tmux_bin = shutil.which("tmux")
+    if not tmux_bin:
+        die("'tmux' not found in PATH")
+    sid = new_session_id()
+    session = tmux_session_name(workspace)
+    record_session({**meta, "id": sid, "host": None, "session": session,
+                    "workspace": workspace, "created": int(time.time())})
+    inner = ["env", "_LUV_INNER=1", f"_LUV_ID={sid}",
+             shutil.which("luv") or "luv"] + luv_args
+    argv = [tmux_bin, "new-session"] + ([] if attach else ["-d"]) + \
+           ["-A", "-s", session, "--"] + inner
+    print(f"luv: local — {session}")
+    if attach:
+        os.execv(tmux_bin, argv)
+    r = subprocess.run(argv)
+    if r.returncode != 0:
+        die(f"could not start {session}")
+    print("luv: started detached — 'luv continue' to attach")
+
+
+def workspace_origin(hc: dict | None, ws: Path) -> tuple[str, str] | None:
+    """(org, repo) from a workspace's origin remote, on either machine."""
+    r = ssh_run(hc, f"git -C {shlex.quote(str(ws))} remote get-url origin")
+    return parse_github_url(r.stdout) if r.returncode == 0 else None
+
+
+def handover_target(args: list[str], identity: str | None, from_host: str | None,
+                    agent: str) -> dict:
+    """The workspace to hand over: a registered session, else a folder on disk.
+
+    The registry only ever learns about sessions luv dispatched to a remote
+    host, so a workspace started on this machine is invisible to it — and the
+    laptop is the usual source of a handover. An agent that has already exited
+    leaves no entry either. Neither is an error: a workspace is movable whether
+    or not something is currently running in it.
+    """
+    sessions, _ = refresh_sessions(identity)
+    rows = [s for s in sessions if s.get("live")]
+    if from_host is not None:
+        want = "" if from_host == "local" else from_host
+        rows = [s for s in rows if (s.get("host") or "") == want]
+    rows, label = filter_sessions(rows, args)
+    if rows:
+        rows.sort(key=session_sort_key, reverse=True)
+        entry = dict(rows[0] if (len(rows) == 1 or args) else choose_session(rows))
+        entry["number"] = workspace_number(entry.get("repo") or "",
+                                           entry.get("workspace") or "")
+        return entry
+
+    if not args:
+        die("no live sessions to hand over; name a workspace: "
+            "luv handover <repo> [number] --to <host>")
+    repo = args[0].rstrip("/").rsplit("/", 1)[-1]
+    number = int(args[1]) if len(args) > 1 and args[1].isdigit() else None
+
+    if from_host is not None and from_host != "local":
+        # Nothing running there, but the folder may still be — ask the host.
+        if number is None:
+            die(f"no live session{label} on {from_host}; "
+                f"name the number too: luv handover {repo} <number> --from {from_host}")
+        hc = resolve_host(from_host, identity)
+        folder_name = resolve_remote_workspace(hc, resolve_org(None), repo, number)
+        if folder_name is None:
+            die(f"no live session{label} on {from_host} and "
+                f"{from_host} could not name a workspace for '{repo}' {number}")
+        _, root = remote_paths(hc)
+        origin = workspace_origin(hc, root / folder_name)
+        return {"host": from_host, "session": tmux_session_name(folder_name),
+                "org": origin[0] if origin else resolve_org(None), "repo": repo,
+                "workspace": folder_name, "number": number, "agent": agent,
+                "prompt": None, "model": None}
+
+    folder = find_workspace(repo, number) if number else find_latest_clone(repo)
+    if folder is None:
+        die(f"no live session{label} and no local workspace for '{repo}' "
+            f"in {PRS_DIR}")
+    number = workspace_number(repo, folder.name)
+    if number is None:
+        die(f"cannot read a workspace number from '{folder.name}'")
+    origin = parse_github_remote(str(folder))
+    return {"host": None, "session": tmux_session_name(folder.name),
+            "org": origin[0] if origin else resolve_org(None),
+            "repo": repo, "workspace": folder.name, "number": number,
+            "agent": agent, "prompt": None, "model": None}
+
+
+def cmd_handover(args: list[str], *, identity: str | None = None,
+                 to: str | None = None, from_host: str | None = None,
+                 agent: str = "claude", force: bool = False, purge: bool = False,
+                 no_agent_state: bool = False, attach: bool = True,
+                 assume_yes: bool = False) -> None:
+    """Move a workspace and its agent's conversation to another machine.
+
+    Everything that can fail is checked before the agent is stopped, so a
+    refusal costs nothing. After that point the source folder is still left
+    intact, so a failed transfer is always recoverable by restarting it there.
+    """
+    if not to:
+        die("handover needs a destination: "
+            "luv handover [<repo> [number]] --to <host>")
+
+    entry = handover_target(args, identity, from_host, agent)
+    if not entry.get("workspace") or entry.get("number") is None:
+        # A session that hasn't reported its folder yet has nothing to move.
+        die(f"'{entry.get('session') or 'that session'}' has no workspace yet — "
+            "wait for it to finish cloning, then try again")
+    src_hc = resolve_host(entry["host"], identity) if entry.get("host") else None
+    dst_hc = None if to == "local" else resolve_host(to, identity)
+    if host_label(src_hc) == host_label(dst_hc):
+        die(f"source and destination are the same machine ({host_label(src_hc)})")
+
+    ws = entry["workspace"]
+    src, dst = host_label(src_hc), host_label(dst_hc)
+    print(f"luv: handing {ws} from {src} to {dst}")
+
+    if dst_hc is not None:
+        preflight_host(dst_hc)
+    src_home, src_root = remote_paths(src_hc)
+    dst_home, dst_root = remote_paths(dst_hc)
+    src_ws, dst_ws = src_root / ws, dst_root / ws
+
+    if ssh_run(src_hc, f"test -d {shlex.quote(str(src_ws))}").returncode != 0:
+        die(f"no workspace at {src_ws} on {src}")
+    exists = ssh_run(dst_hc, f"test -e {shlex.quote(str(dst_ws))}").returncode == 0
+    if exists and not force:
+        die(f"{dst_ws} already exists on {dst} — pass --force to replace it")
+    before = workspace_git_state(src_hc, src_ws)
+
+    # Stop the agent first: copying a workspace out from under a running one is
+    # the only way to get a torn tree. Killing the tmux session SIGHUPs the
+    # pane, so launch()'s docker teardown never runs — do it explicitly.
+    session = entry.get("session") or tmux_session_name(ws)
+    running = ssh_run(
+        src_hc, f"tmux has-session -t {shlex.quote(session)} 2>/dev/null"
+    ).returncode == 0
+    if running:
+        print(f"luv: stopping {session} on {src}")
+    elif not assume_yes:
+        print(f"luv: no tmux session '{session}' on {src} — if an agent is still "
+              "running there in another terminal, stop it first.")
+        if input("Continue? [y/N]: ").strip().lower() not in ("y", "yes"):
+            die("aborted")
+    ssh_run(src_hc, f"tmux kill-session -t {shlex.quote(session)} 2>/dev/null; "
+                    f"docker compose -p {shlex.quote('luv-' + ws)} "
+                    "down -v --remove-orphans 2>/dev/null; true")
+
+    recovery = (f"luv {entry['repo']} {entry['number']} -r"
+                + (f" -s {src}" if src_hc else " --local"))
+    print(f"luv: copying {ws} to {dst}:{dst_root} (if this fails: {recovery})")
+    if exists:
+        ssh_run(dst_hc, f"rm -rf {shlex.quote(str(dst_ws))}")
+    stream_copy(src_hc, src_root, [ws], dst_hc, dst_root)
+
+    if no_agent_state:
+        print("luv: skipping agent state — the agent will start a new conversation")
+    else:
+        members = agent_state_members(src_hc, entry["agent"] or agent, src_ws, src_home)
+        if members:
+            print(f"luv: copying agent state ({len(members)} path"
+                  f"{'' if len(members) == 1 else 's'})")
+            stream_copy(src_hc, src_home, members, dst_hc, dst_home)
+            settle_agent_state(dst_hc, entry["agent"] or agent, members,
+                               src_ws, dst_ws, dst_home)
+        else:
+            print(f"luv: warning: no {entry['agent'] or agent} transcript found for "
+                  f"{src_ws} — the agent will start a new conversation",
+                  file=sys.stderr)
+
+    after = workspace_git_state(dst_hc, dst_ws)
+    if after != before:
+        die(f"copy does not match the source (HEAD/dirty {before} vs {after}); "
+            f"the workspace on {src} is untouched — restart it with: {recovery}")
+
+    if entry.get("id"):
+        with session_lock():
+            save_sessions([s for s in load_sessions() if s.get("id") != entry["id"]])
+    if purge:
+        ssh_run(src_hc, f"rm -rf {shlex.quote(str(src_ws))}")
+        print(f"luv: removed {src_ws} on {src}")
+    else:
+        print(f"luv: source kept at {src}:{src_ws} — 'luv --clean' there to reclaim it")
+
+    luv_args = [f"{entry['org']}/{entry['repo']}", str(entry["number"]), "-r"]
+    if (entry.get("agent") or agent) == "codex":
+        luv_args.append("--codex")
+    if entry.get("model"):
+        luv_args += ["-m", entry["model"]]
+    meta = {"org": entry.get("org"), "repo": entry.get("repo"),
+            "agent": entry.get("agent") or agent, "prompt": entry.get("prompt"),
+            "model": entry.get("model")}
+    if dst_hc is None:
+        start_local_session(ws, luv_args, meta, attach)
+    else:
+        dispatch_remote(dst_hc, luv_args, workspace=ws, meta=meta, detach=not attach)
 
 
 def main() -> None:
@@ -1355,6 +1911,10 @@ def main() -> None:
     safe = "--safe" in args
     env_mode = "-e" in args
     local_mode = "--local" in args
+    no_agent_state = "--no-agent-state" in args
+    no_attach = "--no-attach" in args
+    purge = "--purge" in args
+    assume_yes = "-y" in args
 
     if "--claude" in args and "--codex" in args:
         die("--claude and --codex are mutually exclusive")
@@ -1382,11 +1942,13 @@ def main() -> None:
     base = take_value("-b", "a branch name")
     host_flag = take_value("-s", "a host name")
     identity = take_value("-i", "a path to an SSH key")
+    to_host = take_value("--to", "a host name")
+    from_host = take_value("--from", "a host name")
 
     if local_mode and (host_flag or identity):
         die("--local cannot be combined with -s or -i")
 
-    args = [a for a in args if a not in ("-n", "-r", "-e", "-f", "--force", "-p", "-nit", "--safe", "--claude", "--codex", "--local")]
+    args = [a for a in args if a not in ("-n", "-r", "-e", "-f", "--force", "-p", "-nit", "--safe", "--claude", "--codex", "--local", "--no-agent-state", "--no-attach", "--purge", "-y")]
     extra_env = collect_luv_env() if env_mode else {}
 
     # _LUV_INNER marks the remote-side luv: it must never dispatch onward.
@@ -1411,7 +1973,16 @@ Flags:
   -i PATH       SSH identity file to use for this invocation
   --local       force local execution even when a remote host is configured
   -f, --force   (with --clean) skip safety checks and delete all work folders
+                (with handover) replace an existing folder on the destination
   --safe        (with --clean -f) only delete folders older than 24h
+
+Handover flags:
+  --to HOST     destination machine ('local' for this one)
+  --from HOST   source machine (default: wherever luv last saw the session)
+  --no-agent-state  move the workspace only; the agent starts a new conversation
+  --no-attach   leave the destination session running detached
+  --purge       delete the source folder once the copy is verified
+  -y            skip the "an agent may still be running" confirmation
 
 Commands:
   luv config                              interactive setup (remote host, SSH key, org)
@@ -1420,6 +1991,7 @@ Commands:
   luv --init                              configure default GitHub org only
   luv ls [--host H] [--prune]             list live sessions across hosts
   luv continue [<repo> [number]]          attach to a live session
+  luv handover [<repo> [n]] --to HOST     move a session to another machine
   luv [org/]<repo> [prompt...]            create a new PR workspace
   luv [org/]<repo> -b <branch> [prompt]   create a workspace based off <branch>
   luv [org/]<repo> <number> [prompt]      reopen an existing work folder by number
@@ -1437,7 +2009,15 @@ Remote:
   Once 'luv config' has a remote host, every workspace command runs there inside
   a tmux session that survives disconnects. 'luv ls' shows what is running and
   'luv continue' reattaches. Use --local for a one-off local run.
+  'luv handover' moves a running session — workspace, uncommitted work, and the
+  agent's conversation — to another machine, then resumes it there.
   Requires luv, tmux, gh and git on the remote. See docs/remote-sessions.md.
+
+Naming:
+  Workspaces are {repo}-{machine}-{number} and branches luv-{machine}-{number},
+  where {machine} is this machine's name (config 'machine', default: hostname).
+  It keeps two machines that pick the same number apart. Pre-slug folders and
+  branches keep working.
 
 Docker:
   If the repo contains .luv/settings.json with a "compose_file" key,
@@ -1455,12 +2035,27 @@ Docker:
         cmd_init()
         return
 
+    if args[0] == "--where":
+        cmd_where(args[1:])
+        return
+
+    if args[0] == "--paths":
+        cmd_paths()
+        return
+
     if args[0] == "ls":
         cmd_ls(args[1:], identity)
         return
 
     if args[0] == "continue":
         cmd_continue(args[1:], identity)
+        return
+
+    if args[0] == "handover":
+        cmd_handover(args[1:], identity=identity, to=to_host, from_host=from_host,
+                     agent=agent, force=force, purge=purge,
+                     no_agent_state=no_agent_state, attach=not no_attach,
+                     assume_yes=assume_yes)
         return
 
     if safe and (args[0] != "--clean" or not force):
@@ -1492,19 +2087,21 @@ Docker:
             org_hint = resolve_org(explicit)
             remote_args[0] = f"{org_hint}/{repo_hint}"
 
-        # The workspace folder is {repo}-{number}, so for these forms the tmux
-        # session name is knowable now and 'new-session -A' doubles as attach.
+        # These forms name an existing workspace, so the remote folder — and
+        # with it the tmux session name — can be pinned down before dispatch,
+        # which is what lets 'new-session -A' double as attach.
+        number = None
         if args[0] == "-l" and len(args) > 1:
             m = re.match(r"https://github\.com/([^/]+)/([^/]+)/pull/(\d+)", args[1])
             if m:
                 org_hint, repo_hint = m.group(1), m.group(2)
-                workspace = f"{repo_hint}-{int(m.group(3))}"
+                number = int(m.group(3))
         elif repo_hint and "-pr" in args:
             idx = args.index("-pr")
             if idx + 1 < len(args) and args[idx + 1].isdigit():
-                workspace = f"{repo_hint}-{int(args[idx + 1])}"
+                number = int(args[idx + 1])
         elif repo_hint and len(args) > 1 and args[1].isdigit():
-            workspace = f"{repo_hint}-{int(args[1])}"
+            number = int(args[1])
 
         for flag, enabled in (("--codex", agent == "codex"), ("-n", nav_mode),
                               ("-r", resume_mode), ("-p", plan_mode),
@@ -1520,11 +2117,13 @@ Docker:
         # -nit streams stream-json to a local consumer and --clean just prints;
         # neither wants a tmux session or a registry entry.
         use_tmux = not (non_interactive or args[0] == "--clean")
+        if use_tmux and number is not None and repo_hint:
+            workspace = resolve_remote_workspace(host_cfg, org_hint, repo_hint, number)
         prompt_text = remote_prompt(args)
         meta = None
         if use_tmux:
             meta = {"org": org_hint, "repo": repo_hint, "agent": agent,
-                    "prompt": prompt_text}
+                    "prompt": prompt_text, "model": model}
             if workspace and prompt_text:
                 print(f"luv: note: if {tmux_session_name(workspace)} is already "
                       "running, luv attaches to it and this prompt is not sent",
@@ -1623,11 +2222,12 @@ Docker:
     latest = max(_latest("issues"), _latest("pulls"))
     candidate = latest + 1
 
-    # 3. Find free local folder
+    # 3. Find free local folder. The slug keeps this machine's numbering from
+    # colliding with another machine's; the loop handles collisions on this one.
     PRS_DIR.mkdir(parents=True, exist_ok=True)
-    while (PRS_DIR / f"{repo}-{candidate}").exists():
+    while (PRS_DIR / workspace_name(repo, candidate)).exists():
         candidate += 1
-    clone_dir = PRS_DIR / f"{repo}-{candidate}"
+    clone_dir = PRS_DIR / workspace_name(repo, candidate)
 
     # 4. Clone (off the base branch when -b was given)
     print(f"luv: cloning {clone_url} -> {clone_dir}" + (f" (base {base})" if base else ""))
@@ -1640,7 +2240,7 @@ Docker:
         die(f"git clone failed (exit {r.returncode})")
 
     # 5. Create branch off the cloned HEAD (= base when -b was given, else default)
-    branch = f"luv-{candidate}"
+    branch = branch_name(candidate)
     print(f"luv: creating branch {branch}")
     r = subprocess.run(["git", "checkout", "-b", branch], cwd=str(clone_dir))
     if r.returncode != 0:

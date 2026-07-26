@@ -29,11 +29,12 @@ the session (which luv does as soon as the clone lands) breaks nothing.
     {
       "id": "k3f9a2c1",
       "host": "box",
-      "session": "luv-myrepo-42",
+      "session": "luv-myrepo-box-42",
       "org": "exosphere",
       "repo": "myrepo",
-      "workspace": "myrepo-42",
+      "workspace": "myrepo-box-42",
       "agent": "claude",
+      "model": null,
       "prompt": "fix the flaky test",
       "created": 1753401234,
       "last_seen": 1753408899
@@ -48,8 +49,9 @@ the session (which luv does as soon as the clone lands) breaks nothing.
 | `host` | The `remote.host` value used, or absent for a local session |
 | `session` | tmux session name; starts as `luv-pending-<id>` and is corrected on the first reconcile |
 | `org`, `repo` | GitHub owner and repo, resolved on the laptop |
-| `workspace` | Folder name (`myrepo-42`); `null` until the remote reports it |
+| `workspace` | Folder name (`myrepo-box-42`); `null` until the remote reports it. The middle part names the machine that created it — see [configuration.md](configuration.md#machine) |
 | `agent` | `claude` or `codex` |
+| `model` | The `-m` value, or `null` for the agent's default; replayed by `luv handover` |
 | `prompt` | The prompt you launched with, for the `luv ls` label |
 | `created` | Unix time the entry was written |
 | `last_seen` | Unix time of the last successful reconcile |
@@ -59,8 +61,8 @@ deliberately **not** written back to the file.
 
 ## Reconciliation
 
-On `luv ls` and `luv continue`, luv groups entries by host and runs one query
-per host (concurrently when there's more than one):
+On `luv ls`, `luv continue`, and `luv handover`, luv groups entries by host and
+runs one query per host (concurrently when there's more than one):
 
 ```
 tmux list-sessions -F '#{@luv_id}|#{session_name}|#{@luv_workspace}|#{session_attached}|#{session_activity}'
@@ -92,6 +94,18 @@ luv ls --prune
 
 That drops entries for hosts that didn't answer, in addition to the dead ones
 reconciliation already removed.
+
+## Handover
+
+`luv handover` replaces the moved session's entry rather than editing it: the
+old one is dropped and the destination writes a fresh entry, with a new `id` and
+`@luv_id`, carrying the original `org`, `repo`, `agent`, `model`, and `prompt`.
+The `workspace` name is unchanged, slug and all.
+
+Note that the registry only ever learns about sessions luv **dispatched to a
+host** — a `luv --local` run records nothing. So a workspace on the machine
+you're sitting at is normally absent from it, which is why handover falls back
+to looking on disk instead of treating a miss as an error.
 
 ## Concurrency
 

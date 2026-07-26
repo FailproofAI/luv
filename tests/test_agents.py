@@ -106,9 +106,16 @@ class RemoteDispatchTests(unittest.TestCase):
             p.stop()
         self.tempdir.cleanup()
 
-    def _dispatch(self, argv, env=None):
+    def _dispatch(self, argv, env=None, where=None):
+        """Dispatch and return the argv handed to ssh.
+
+        `where` is what the remote's 'luv --where' answers; None makes the host
+        look unreachable, which is what drives the luv-pending fallback.
+        """
+        answer = _completed(f"{where}\n") if where else _completed(returncode=255)
         with (patch.object(sys, "argv", ["luv"] + argv),
               patch.dict(luv.os.environ, env or {}, clear=False),
+              patch.object(luv, "ssh_run", return_value=answer),
               patch.object(luv.shutil, "which", side_effect=lambda n: f"/bin/{n}"),
               patch.object(luv.os, "execv") as execv,
               contextlib.redirect_stdout(io.StringIO()),
@@ -127,15 +134,33 @@ class RemoteDispatchTests(unittest.TestCase):
         self.assertIn("_LUV_TMUX_PENDING=", argv[-1])
 
     def test_reopen_by_number_gets_deterministic_session(self):
-        argv = self._dispatch(["myrepo", "42", "keep going"])
+        argv = self._dispatch(["myrepo", "42", "keep going"], where="myrepo-box-42")
 
-        self.assertIn("tmux new-session -A -s luv-myrepo-42", argv[-1])
+        self.assertIn("tmux new-session -A -s luv-myrepo-box-42", argv[-1])
         self.assertNotIn("_LUV_TMUX_PENDING", argv[-1])
 
-    def test_pr_url_derives_session_from_url(self):
-        argv = self._dispatch(["-l", "https://github.com/other/thing/pull/7"])
+    def test_reopen_falls_back_to_pending_when_host_is_silent(self):
+        # A folder name we cannot resolve must not become a guess: the remote
+        # renames the pending session once it knows.
+        argv = self._dispatch(["myrepo", "42", "keep going"])
 
-        self.assertIn("-s luv-thing-7", argv[-1])
+        self.assertIn("luv-pending-", argv[-1])
+        self.assertIn("_LUV_TMUX_PENDING=", argv[-1])
+
+    def test_reopen_by_number_prefers_the_registry_over_a_round_trip(self):
+        luv.record_session({"id": "abc", "host": "box", "repo": "myrepo",
+                            "workspace": "myrepo-mbp-42",
+                            "session": "luv-myrepo-mbp-42"})
+
+        argv = self._dispatch(["myrepo", "42"], where="myrepo-box-42")
+
+        self.assertIn("tmux new-session -A -s luv-myrepo-mbp-42", argv[-1])
+
+    def test_pr_url_derives_session_from_url(self):
+        argv = self._dispatch(["-l", "https://github.com/other/thing/pull/7"],
+                              where="thing-box-7")
+
+        self.assertIn("-s luv-thing-box-7", argv[-1])
 
     def test_host_flag_selects_per_host_settings(self):
         argv = self._dispatch(["-s", "gpu", "ml", "train"])
@@ -421,6 +446,322 @@ class CleanGuardTests(unittest.TestCase):
 
         self.assertFalse(rmtree.called)
         self.assertIn("live tmux session", out.getvalue())
+
+    def test_branch_comes_from_git_not_the_folder_name(self):
+        # A handed-over folder carries another machine's slug, so rebuilding the
+        # branch from the name would fetch the wrong ref — or none at all.
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        root = Path(tempdir.name)
+        (root / "myrepo-box-42").mkdir()
+        seen = {}
+
+        def fake_run(cmd, cwd=None):
+            if cmd[:2] == ["git", "rev-parse"] and "--abbrev-ref" in cmd:
+                return _completed("luv-mbp-42\n")
+            if cmd[:2] == ["git", "fetch"]:
+                seen["fetch"] = cmd
+                return _completed(returncode=1)
+            return _completed()
+
+        with (patch.object(luv, "PRS_DIR", root),
+              patch.object(luv, "live_tmux_sessions", return_value=set()),
+              patch.object(luv, "run", side_effect=fake_run),
+              patch.object(luv, "parse_github_remote", return_value=None),
+              patch.object(luv, "_force_rmtree"),
+              contextlib.redirect_stdout(io.StringIO())):
+            luv.cmd_clean(force=False)
+
+        self.assertEqual(seen["fetch"], ["git", "fetch", "origin", "luv-mbp-42"])
+
+
+class NamingTests(unittest.TestCase):
+    """Workspace and branch names have to be unique per machine."""
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self.root = Path(self.tempdir.name)
+        p = patch.object(luv, "PRS_DIR", self.root)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _slug(self, slug):
+        return patch.object(luv, "machine_slug", return_value=slug)
+
+    def test_configured_machine_name_wins(self):
+        with patch.object(luv, "load_config", return_value={"machine": "MBP-16!"}):
+            self.assertEqual(luv.machine_slug(), "mbp16")
+
+    def test_hostname_is_the_fallback(self):
+        with (patch.object(luv, "load_config", return_value={}),
+              patch.object(luv.socket, "gethostname",
+                           return_value="Niveds-MacBook.local")):
+            self.assertEqual(luv.machine_slug(), "nivedsma")
+
+    def test_slug_never_contains_a_separator(self):
+        # workspace_re reads '{repo}-{slug}-{number}'; a '-' inside the slug
+        # would make that ambiguous.
+        self.assertNotIn("-", luv.sanitize_slug("gpu-box-01"))
+        self.assertEqual(luv.sanitize_slug("gpu-box-01"), "gpubox01")
+
+    def test_unusable_machine_name_falls_back(self):
+        with (patch.object(luv, "load_config", return_value={"machine": "!!!"}),
+              patch.object(luv.socket, "gethostname", return_value="???")):
+            self.assertEqual(luv.machine_slug(), "local")
+
+    def test_names_carry_the_slug(self):
+        with self._slug("mbp"):
+            self.assertEqual(luv.workspace_name("myrepo", 42), "myrepo-mbp-42")
+            self.assertEqual(luv.branch_name(42), "luv-mbp-42")
+            self.assertEqual(luv.tmux_session_name(luv.workspace_name("myrepo", 42)),
+                             "luv-myrepo-mbp-42")
+            self.assertEqual(luv.docker_project_name(self.root / "myrepo-mbp-42"),
+                             "luv-myrepo-mbp-42")
+
+    def test_number_is_read_from_either_form(self):
+        self.assertEqual(luv.workspace_number("myrepo", "myrepo-mbp-42"), 42)
+        self.assertEqual(luv.workspace_number("myrepo", "myrepo-42"), 42)
+        self.assertIsNone(luv.workspace_number("myrepo", "other-mbp-42"))
+
+    def test_find_workspace_prefers_our_own(self):
+        for name in ("myrepo-42", "myrepo-box-42", "myrepo-mbp-42"):
+            (self.root / name).mkdir()
+        with self._slug("mbp"):
+            self.assertEqual(luv.find_workspace("myrepo", 42).name, "myrepo-mbp-42")
+
+    def test_find_workspace_finds_a_handed_over_folder(self):
+        # It keeps the slug of the machine that made it, which is not this one.
+        (self.root / "myrepo-box-42").mkdir()
+        with self._slug("mbp"):
+            self.assertEqual(luv.find_workspace("myrepo", 42).name, "myrepo-box-42")
+
+    def test_find_workspace_still_finds_pre_slug_folders(self):
+        (self.root / "myrepo-42").mkdir()
+        with self._slug("mbp"):
+            self.assertEqual(luv.find_workspace("myrepo", 42).name, "myrepo-42")
+
+    def test_two_foreign_candidates_are_ambiguous(self):
+        for name in ("myrepo-box-42", "myrepo-gpu-42"):
+            (self.root / name).mkdir()
+        with self._slug("mbp"), self.assertRaises(SystemExit), \
+                contextlib.redirect_stderr(io.StringIO()):
+            luv.find_workspace("myrepo", 42)
+
+    def test_find_latest_clone_spans_both_forms(self):
+        for name in ("myrepo-7", "myrepo-box-41", "myrepo-mbp-9", "other-mbp-99"):
+            (self.root / name).mkdir()
+        with self._slug("mbp"):
+            self.assertEqual(luv.find_latest_clone("myrepo").name, "myrepo-box-41")
+
+    def test_branch_re_matches_both_forms(self):
+        self.assertTrue(luv.branch_re(42).match("luv-mbp-42"))
+        self.assertTrue(luv.branch_re(42).match("luv-42"))
+        self.assertFalse(luv.branch_re(42).match("luv-mbp-420"))
+
+    def test_where_reports_the_folder_a_host_would_use(self):
+        (self.root / "myrepo-box-42").mkdir()
+        out = io.StringIO()
+        with self._slug("mbp"), contextlib.redirect_stdout(out):
+            luv.cmd_where(["exo/myrepo", "42"])
+            luv.cmd_where(["exo/myrepo", "77"])
+
+        self.assertEqual(out.getvalue().split(), ["myrepo-box-42", "myrepo-mbp-77"])
+
+
+class HandoverTests(unittest.TestCase):
+    """Moving a workspace between machines."""
+
+    SRC = Path("/home/u/prs")
+    DST = Path("/remote/prs")
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        root = Path(self.tempdir.name)
+        (root / "prs").mkdir()
+        self.prs = root / "prs"
+        self.patches = [
+            patch.object(luv, "LUV_DIR", root),
+            patch.object(luv, "SESSIONS_FILE", root / "sessions.json"),
+            patch.object(luv, "SESSIONS_LOCK", root / "sessions.lock"),
+            patch.object(luv, "PRS_DIR", self.prs),
+            patch.object(luv, "machine_slug", return_value="mbp"),
+            patch.object(luv, "load_config", return_value=REMOTE_CONFIG),
+        ]
+        for p in self.patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _run(self, args, ssh=None, sessions=(), **kwargs):
+        """Hand over with the network stubbed; returns (ssh calls, mocks).
+
+        The call list is also kept on self, so a test that expects cmd_handover
+        to bail out can still see how far it got.
+        """
+        calls = self._calls = []
+
+        def fake_ssh(hc, cmd, **kw):
+            calls.append((luv.host_label(hc), cmd))
+            if ssh:
+                override = ssh(cmd)
+                if override is not None:
+                    return override
+            # No folder in the way on the destination; a session running on the
+            # source, so no confirmation is needed.
+            return _completed(returncode=1) if "test -e" in cmd else _completed()
+
+        def fake_paths(hc):
+            return (Path("/home/u"), self.prs) if hc is None else \
+                   (Path("/remote"), self.DST)
+
+        with (patch.object(luv, "ssh_run", side_effect=fake_ssh),
+              patch.object(luv, "preflight_host"),
+              patch.object(luv, "refresh_sessions",
+                           return_value=(list(sessions), set())),
+              patch.object(luv, "remote_paths", side_effect=fake_paths),
+              patch.object(luv, "parse_github_remote", return_value=("exo", "myrepo")),
+              patch.object(luv, "stream_copy") as stream,
+              patch.object(luv, "dispatch_remote") as dispatch,
+              patch.object(luv, "start_local_session") as local,
+              contextlib.redirect_stdout(io.StringIO()),
+              contextlib.redirect_stderr(io.StringIO())):
+            luv.cmd_handover(args, **kwargs)
+        return calls, {"stream": stream, "dispatch": dispatch, "local": local}
+
+    def _workspace(self, name="myrepo-mbp-42"):
+        (self.prs / name).mkdir()
+
+    def test_destination_is_required(self):
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            self._run(["myrepo", "42"])
+
+    def test_same_machine_is_rejected(self):
+        self._workspace()
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            self._run(["myrepo", "42"], to="local")
+
+    def test_local_workspace_is_found_without_a_registry_entry(self):
+        # A session started on this machine was never recorded, and that is the
+        # usual source of a handover.
+        self._workspace()
+        _, mocks = self._run(["myrepo", "42"], to="box")
+
+        args, kwargs = mocks["dispatch"].call_args
+        self.assertEqual(args[1], ["exo/myrepo", "42", "-r"])
+        self.assertEqual(kwargs["workspace"], "myrepo-mbp-42")
+
+    def test_codex_and_model_are_replayed(self):
+        self._workspace()
+        entry = {"id": "abc", "host": "box", "session": "luv-myrepo-gpu-9",
+                 "org": "exo", "repo": "myrepo", "workspace": "myrepo-gpu-9",
+                 "agent": "codex", "model": "gpt-5", "prompt": "keep going",
+                 "live": True}
+        _, mocks = self._run(["myrepo", "9"], to="local", sessions=[entry])
+
+        args = mocks["local"].call_args.args
+        self.assertEqual(args[0], "myrepo-gpu-9")  # slug is sticky
+        self.assertEqual(args[1], ["exo/myrepo", "9", "-r", "--codex", "-m", "gpt-5"])
+        self.assertEqual(args[2]["prompt"], "keep going")
+
+    def test_existing_destination_folder_aborts_before_anything_is_killed(self):
+        self._workspace()
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            self._run(["myrepo", "42"], to="box",
+                      ssh=lambda cmd: _completed())  # every path already exists
+
+        self.assertNotIn("kill-session",
+                         " ".join(cmd for _, cmd in self._calls))
+
+    def test_source_is_stopped_and_docker_torn_down(self):
+        self._workspace()
+        calls, _ = self._run(["myrepo", "42"], to="box")
+        joined = " ".join(cmd for _, cmd in calls)
+
+        self.assertIn("tmux kill-session -t luv-myrepo-mbp-42", joined)
+        self.assertIn("docker compose -p luv-myrepo-mbp-42 down", joined)
+
+    def test_source_folder_is_kept_by_default(self):
+        self._workspace()
+        calls, _ = self._run(["myrepo", "42"], to="box")
+
+        self.assertNotIn("rm -rf", " ".join(cmd for _, cmd in calls))
+
+    def test_purge_removes_the_source(self):
+        self._workspace()
+        calls, _ = self._run(["myrepo", "42"], to="box", purge=True)
+
+        self.assertIn(f"rm -rf {self.prs}/myrepo-mbp-42",
+                      " ".join(cmd for _, cmd in calls))
+
+    def test_agent_state_is_a_second_stream(self):
+        self._workspace()
+        _, mocks = self._run(["myrepo", "42"], to="box")
+
+        self.assertEqual(mocks["stream"].call_count, 2)
+
+    def test_no_agent_state_copies_only_the_workspace(self):
+        self._workspace()
+        _, mocks = self._run(["myrepo", "42"], to="box", no_agent_state=True)
+
+        self.assertEqual(mocks["stream"].call_count, 1)
+
+    def test_a_mismatched_copy_stops_before_restarting(self):
+        self._workspace()
+
+        def ssh(cmd):
+            if "rev-parse HEAD" in cmd:
+                # Different answers for source and destination.
+                ssh.n += 1
+                return _completed(f"sha{ssh.n} 0\n")
+            return None
+        ssh.n = 0
+
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            self._run(["myrepo", "42"], to="box", ssh=ssh)
+
+
+class TransferTests(unittest.TestCase):
+    """The tar relay and the transcript rewrite."""
+
+    def test_local_endpoints_skip_ssh(self):
+        argv = luv.tar_send_argv(None, Path("/a"), ["ws"])
+
+        self.assertEqual(argv, ["tar", "-C", "/a", "-czf", "-", "ws"])
+
+    def test_remote_send_never_allocates_a_tty(self):
+        # ssh -t would translate newlines and corrupt the tar stream.
+        argv = luv.tar_send_argv({"host": "box"}, Path("/a"), ["ws"])
+
+        self.assertEqual(argv[0], "ssh")
+        self.assertNotIn("-t", argv)
+        self.assertIn("tar -C /a -czf - ws", argv[-1])
+
+    def test_remote_receive_creates_the_root_first(self):
+        argv = luv.tar_recv_argv({"host": "box"}, Path("/b"))
+
+        self.assertIn("mkdir -p /b && tar -C /b -xzf -", argv[-1])
+
+    def test_claude_project_slug_matches_claudes_own(self):
+        self.assertEqual(luv.claude_project_slug(Path("/Users/n/prs/myrepo-mbp-43")),
+                         "-Users-n-prs-myrepo-mbp-43")
+
+    def test_rewrite_is_a_noop_when_paths_agree(self):
+        self.assertEqual(luv.rewrite_script("f", "/same", "/same"), "true")
+
+    def test_rewrite_avoids_sed_dash_i(self):
+        # -i takes an argument on BSD sed and not on GNU sed; the laptop half of
+        # a handover is usually a Mac.
+        script = luv.rewrite_script("'/d'/*.jsonl", "/old/ws", "/new/ws")
+
+        self.assertNotIn("sed -i", script)
+        self.assertIn("s|/old/ws|/new/ws|g", script)
+
+    def test_stream_copy_does_nothing_without_members(self):
+        with patch.object(luv.subprocess, "Popen") as popen:
+            luv.stream_copy(None, Path("/a"), [], None, Path("/b"))
+
+        self.assertFalse(popen.called)
 
 
 if __name__ == "__main__":
