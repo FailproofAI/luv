@@ -114,11 +114,16 @@ box   luv-myrepo-51   myrepo-51   codex   no        1h ago  -     add rate limit
 stdout isn't a terminal there's nothing to click and a bare number would be
 useless, so `luv ls | grep` and redirects get the full URL instead.
 
-The lookup asks GitHub for the PR whose head is `{org}:luv-{N}`:
+The lookup asks GitHub for the PR whose head branch is `luv-{N}`:
 
 ```
-gh api repos/{org}/{repo}/pulls -f state=all -f head={org}:luv-{N}
+gh pr list --repo {org}/{repo} --head luv-{N} --state all --limit 1 --json number,url
 ```
+
+`gh pr list` rather than the REST endpoint because its `--head` takes a bare
+branch name. REST wants `head={owner}:{branch}`, and the owner luv recorded is
+whatever you typed — which stops matching the moment the org is renamed or the
+repo is transferred.
 
 It is a head query and nothing else. Checking whether PR `#N` merely *exists*
 would show a stranger's PR whenever someone took that number between luv

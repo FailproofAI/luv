@@ -464,7 +464,7 @@ class PrLinkTests(unittest.TestCase):
         entry.update(over)
         return entry
 
-    _PR_JSON = '[{"number": 42, "html_url": "https://github.com/acme/myrepo/pull/42"}]'
+    _PR_JSON = '[{"number": 42, "url": "https://github.com/acme/myrepo/pull/42"}]'
 
     def test_head_query_populates_the_link(self):
         rows = [self._session()]
@@ -474,7 +474,20 @@ class PrLinkTests(unittest.TestCase):
 
         self.assertEqual(rows[0]["pr_number"], 42)
         self.assertEqual(rows[0]["pr_url"], "https://github.com/acme/myrepo/pull/42")
-        self.assertIn("head=acme:luv-42", run.call_args.args[0])
+        self.assertIn("luv-42", run.call_args.args[0])
+
+    def test_branch_is_queried_without_an_owner_prefix(self):
+        # REST's head= filter needs {owner}:{branch}, and the owner luv recorded
+        # stops matching once the org is renamed. gh pr list takes a bare branch.
+        rows = [self._session()]
+
+        with patch.object(luv, "run", return_value=_completed(self._PR_JSON)) as run:
+            luv.attach_pr_links(rows)
+
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[:3], ["gh", "pr", "list"])
+        self.assertEqual(argv[argv.index("--head") + 1], "luv-42")
+        self.assertNotIn("acme:luv-42", argv)
 
     def test_cached_result_is_not_refetched(self):
         rows = [self._session(pr_number=42, pr_url="https://x/42",

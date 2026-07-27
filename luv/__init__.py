@@ -1261,23 +1261,24 @@ def fetch_pr(org: str, repo: str, number: int) -> dict | None:
     would happily return a stranger's PR whenever someone took that number
     between luv reserving the folder and the agent pushing. Sessions opened from
     an existing PR carry pr_hint instead — see attach_pr_links.
+
+    `gh pr list` rather than the REST endpoint because its --head takes a bare
+    branch name. REST wants `head={owner}:{branch}`, and the owner luv recorded
+    is whatever you typed — which stops matching the moment the org is renamed
+    or the repo is transferred.
     """
-    r = run(["gh", "api", f"repos/{org}/{repo}/pulls",
-             "-f", "state=all", "-f", f"head={org}:luv-{number}",
-             "-f", "per_page=1", "-f", "sort=created", "-f", "direction=desc"],
-            timeout=PR_TIMEOUT)
+    r = run(["gh", "pr", "list", "--repo", f"{org}/{repo}",
+             "--head", f"luv-{number}", "--state", "all", "--limit", "1",
+             "--json", "number,url"], timeout=PR_TIMEOUT)
     if r.returncode != 0:
         return None
     try:
         prs = json.loads(r.stdout)
     except json.JSONDecodeError:
         return None
-    if not isinstance(prs, list) or not prs:
+    if not isinstance(prs, list) or not prs or not prs[0].get("url"):
         return None
-    pr = prs[0]
-    if not pr.get("html_url"):
-        return None
-    return {"number": pr.get("number"), "url": pr["html_url"]}
+    return {"number": prs[0].get("number"), "url": prs[0]["url"]}
 
 
 def attach_pr_links(rows: list[dict]) -> bool:
