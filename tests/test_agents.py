@@ -122,11 +122,11 @@ class RemoteDispatchTests(unittest.TestCase):
         with (patch.object(sys, "argv", ["luv"] + argv),
               patch.dict(luv.os.environ, env, clear=False),
               patch.object(luv.shutil, "which", side_effect=lambda n: f"/bin/{n}"),
-              patch.object(luv.os, "execv") as execv,
+              patch.object(luv, "hand_over") as hand_over,
               contextlib.redirect_stdout(io.StringIO()),
               contextlib.redirect_stderr(io.StringIO())):
             luv.main()
-        return execv.call_args.args[1] if execv.called else None
+        return hand_over.call_args.args[0] if hand_over.called else None
 
     def test_new_workspace_gets_pending_session(self):
         argv = self._dispatch(["myrepo", "fix it"])
@@ -217,6 +217,129 @@ class RemoteDispatchTests(unittest.TestCase):
     def test_local_flag_rejects_ssh_flags(self):
         with self.assertRaises(SystemExit):
             self._dispatch(["--local", "-s", "gpu", "myrepo"])
+
+
+class _FakeProc:
+    """A child that can raise KeyboardInterrupt before it finally exits."""
+
+    def __init__(self, returncode=0, interrupts=0):
+        self.returncode = returncode
+        self.interrupts = interrupts
+
+    def wait(self):
+        if self.interrupts:
+            self.interrupts -= 1
+            raise KeyboardInterrupt
+        return self.returncode
+
+
+class TerminalRestoreTests(unittest.TestCase):
+    """A connection that dies must not leave the terminal in the remote
+    program's modes — that's the "35;22;1M" junk at the shell prompt."""
+
+    FD = 42
+    SAVED = ["saved", "termios", "attrs"]
+
+    def _hand_over(self, argv, returncode=0, interrupts=0, **kwargs):
+        proc = _FakeProc(returncode, interrupts)
+        self.writes = []
+        with (patch.object(luv, "terminal_fd", return_value=self.FD),
+              patch.object(luv.subprocess, "Popen", return_value=proc) as popen,
+              patch.object(luv.termios, "tcgetattr", return_value=self.SAVED),
+              patch.object(luv.termios, "tcsetattr") as tcsetattr,
+              patch.object(luv.os, "execv") as execv,
+              patch.object(luv.os, "write",
+                           side_effect=lambda fd, data: self.writes.append((fd, data))),
+              self.assertRaises(SystemExit) as exit_ctx):
+            luv.hand_over(argv, **kwargs)
+        self.popen, self.tcsetattr, self.execv = popen, tcsetattr, execv
+        return exit_ctx.exception.code
+
+    def _reset_bytes(self):
+        return b"".join(data for fd, data in self.writes if fd == self.FD)
+
+    def test_broken_connection_still_restores_the_terminal(self):
+        # 255 is what ssh exits with when the connection drops under it.
+        code = self._hand_over(["/bin/ssh", "box", "tmux attach"], returncode=255)
+
+        self.assertEqual(code, 255, "the child's exit code must still pass through")
+        self.assertTrue(self.popen.called, "restore mode must not exec the child away")
+        self.assertIn(b"\x1b[?1003l", self._reset_bytes(), "mouse tracking left on")
+        self.assertIn(b"\x1b[?1006l", self._reset_bytes(), "SGR mouse reports left on")
+        self.assertIn(b"\x1b[?2004l", self._reset_bytes(), "bracketed paste left on")
+        self.assertIn(b"\x1b[?1049l", self._reset_bytes(), "alternate screen left on")
+        self.assertEqual(self.tcsetattr.call_args.args[0], self.FD)
+        self.assertEqual(self.tcsetattr.call_args.args[2], self.SAVED)
+
+    def test_clean_exit_restores_too(self):
+        code = self._hand_over(["/bin/tmux", "attach"], returncode=0)
+
+        self.assertEqual(code, 0)
+        self.assertIn(b"\x1b[?1003l", self._reset_bytes())
+
+    def test_ctrl_c_does_not_kill_the_parent_before_cleanup(self):
+        # Ctrl-C reaches the child through the tty; the parent must outlive it
+        # or there is nobody left to clean up after it.
+        code = self._hand_over(["/bin/ssh", "box"], returncode=130, interrupts=2)
+
+        self.assertEqual(code, 130)
+        self.assertIn(b"\x1b[?1003l", self._reset_bytes())
+
+    def test_no_tty_handoff_still_execs(self):
+        # -nit streams stream-json into a pipe: no terminal to restore, so keep
+        # the cheaper exec and don't leave a process in the middle.
+        writes = []
+        with (patch.object(luv, "terminal_fd", return_value=self.FD),
+              patch.object(luv.os, "execv") as execv,
+              patch.object(luv.os, "write", side_effect=writes.append),
+              patch.object(luv.subprocess, "Popen") as popen):
+            luv.hand_over(["/bin/ssh", "box"], restore=False)
+
+        self.assertEqual(execv.call_args.args, ("/bin/ssh", ["/bin/ssh", "box"]))
+        self.assertFalse(popen.called)
+        self.assertEqual(writes, [])
+
+    def test_guard_is_a_noop_without_a_terminal(self):
+        with (patch.object(luv, "terminal_fd", return_value=None),
+              patch.object(luv.os, "write") as write,
+              patch.object(luv.termios, "tcsetattr") as tcsetattr):
+            with luv.terminal_guard():
+                pass
+
+        self.assertFalse(write.called)
+        self.assertFalse(tcsetattr.called)
+
+    def test_restore_survives_a_child_that_never_started(self):
+        # An OSError out of Popen must not skip the cleanup either.
+        writes = []
+        with (patch.object(luv, "terminal_fd", return_value=self.FD),
+              patch.object(luv.termios, "tcgetattr", return_value=self.SAVED),
+              patch.object(luv.termios, "tcsetattr"),
+              patch.object(luv.os, "write",
+                           side_effect=lambda fd, data: writes.append(data)),
+              patch.object(luv.subprocess, "Popen", side_effect=OSError("boom"))):
+            with self.assertRaises(OSError):
+                luv.hand_over(["/bin/ssh", "box"])
+
+        self.assertIn(b"\x1b[?1003l", b"".join(writes))
+
+    def test_local_attach_goes_through_the_guard(self):
+        with (patch.object(luv.shutil, "which", side_effect=lambda n: f"/bin/{n}"),
+              patch.object(luv, "hand_over") as hand_over):
+            luv.attach_session(None, "luv-myrepo-42")
+
+        self.assertEqual(hand_over.call_args.args[0],
+                         ["/bin/tmux", "attach", "-d", "-t", "luv-myrepo-42"])
+
+    def test_remote_attach_asks_for_a_tty_and_restores(self):
+        with (patch.object(luv.shutil, "which", side_effect=lambda n: f"/bin/{n}"),
+              patch.object(luv, "hand_over") as hand_over,
+              contextlib.redirect_stdout(io.StringIO())):
+            luv.attach_session({"host": "box"}, "luv-myrepo-42")
+
+        argv = hand_over.call_args.args[0]
+        self.assertIn("-t", argv)
+        self.assertNotEqual(hand_over.call_args.kwargs.get("restore"), False)
 
 
 class SessionNameTests(unittest.TestCase):
