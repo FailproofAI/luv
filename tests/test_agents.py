@@ -1,7 +1,9 @@
 import contextlib
 import io
+import re
 import subprocess
 import tempfile
+import time
 import unittest
 import sys
 from pathlib import Path
@@ -97,6 +99,11 @@ class RemoteDispatchTests(unittest.TestCase):
             patch.object(luv, "SESSIONS_FILE", root / "sessions.json"),
             patch.object(luv, "SESSIONS_LOCK", root / "sessions.lock"),
             patch.object(luv, "load_config", return_value=REMOTE_CONFIG),
+            # These tests call main(), which can reach cmd_clean's rmtree on the
+            # local path. Point it at a scratch dir and stub the delete, so a
+            # test that stops dispatching can never eat the real ~/prs.
+            patch.object(luv, "PRS_DIR", root / "prs"),
+            patch.object(luv, "_force_rmtree"),
         ]
         for p in self.patches:
             p.start()
@@ -107,8 +114,13 @@ class RemoteDispatchTests(unittest.TestCase):
         self.tempdir.cleanup()
 
     def _dispatch(self, argv, env=None):
+        # _LUV_INNER marks a remote-side luv and makes main() refuse to dispatch.
+        # It is set in every luv-launched shell — including the one a developer
+        # runs these tests from — so clear it or every case below silently
+        # becomes a local-execution test.
+        env = {"_LUV_INNER": "", **(env or {})}
         with (patch.object(sys, "argv", ["luv"] + argv),
-              patch.dict(luv.os.environ, env or {}, clear=False),
+              patch.dict(luv.os.environ, env, clear=False),
               patch.object(luv.shutil, "which", side_effect=lambda n: f"/bin/{n}"),
               patch.object(luv.os, "execv") as execv,
               contextlib.redirect_stdout(io.StringIO()),
@@ -421,6 +433,173 @@ class CleanGuardTests(unittest.TestCase):
 
         self.assertFalse(rmtree.called)
         self.assertIn("live tmux session", out.getvalue())
+
+
+class WorkspaceNumberTests(unittest.TestCase):
+    def test_parses_trailing_number(self):
+        self.assertEqual(luv.workspace_number("myrepo-42"), 42)
+
+    def test_handles_repos_with_hyphens(self):
+        self.assertEqual(luv.workspace_number("my-cool-repo-7"), 7)
+
+    def test_rejects_non_workspace_names(self):
+        self.assertIsNone(luv.workspace_number("myrepo"))
+        self.assertIsNone(luv.workspace_number("myrepo-main"))
+        self.assertIsNone(luv.workspace_number(None))
+
+
+class PrLinkTests(unittest.TestCase):
+    """The PR column: authoritative, cached, and never blocking on gh."""
+
+    def setUp(self):
+        self.which = patch.object(luv.shutil, "which",
+                                  side_effect=lambda name: f"/bin/{name}")
+        self.which.start()
+        self.addCleanup(self.which.stop)
+
+    @staticmethod
+    def _session(**over):
+        entry = {"id": "abc123", "org": "acme", "repo": "myrepo",
+                 "workspace": "myrepo-42"}
+        entry.update(over)
+        return entry
+
+    _PR_JSON = '[{"number": 42, "html_url": "https://github.com/acme/myrepo/pull/42"}]'
+
+    def test_head_query_populates_the_link(self):
+        rows = [self._session()]
+
+        with patch.object(luv, "run", return_value=_completed(self._PR_JSON)) as run:
+            self.assertTrue(luv.attach_pr_links(rows))
+
+        self.assertEqual(rows[0]["pr_number"], 42)
+        self.assertEqual(rows[0]["pr_url"], "https://github.com/acme/myrepo/pull/42")
+        self.assertIn("head=acme:luv-42", run.call_args.args[0])
+
+    def test_cached_result_is_not_refetched(self):
+        rows = [self._session(pr_number=42, pr_url="https://x/42",
+                              pr_checked=int(time.time()))]
+
+        with patch.object(luv, "run") as run:
+            self.assertFalse(luv.attach_pr_links(rows))
+
+        self.assertFalse(run.called, "a fresh cache entry must not hit the network")
+
+    def test_stale_cache_is_refetched(self):
+        rows = [self._session(pr_url="https://x/42",
+                              pr_checked=int(time.time()) - luv.PR_TTL_OK - 1)]
+
+        with patch.object(luv, "run", return_value=_completed(self._PR_JSON)) as run:
+            luv.attach_pr_links(rows)
+
+        self.assertTrue(run.called)
+
+    def test_missing_pr_is_cached_briefly(self):
+        # No PR yet is the volatile case: re-ask sooner than for one we found.
+        rows = [self._session(pr_checked=int(time.time()) - 1)]
+
+        with patch.object(luv, "run") as run:
+            luv.attach_pr_links(rows)
+        self.assertFalse(run.called)
+
+        rows[0]["pr_checked"] = int(time.time()) - luv.PR_TTL_MISS - 1
+        with patch.object(luv, "run", return_value=_completed("[]")) as run:
+            luv.attach_pr_links(rows)
+        self.assertTrue(run.called)
+        self.assertIsNone(rows[0]["pr_url"])
+
+    def test_pr_hint_resolves_without_a_network_call(self):
+        # -l / -pr sessions: the branch is the PR's own head ref, so the head
+        # query would never find it — but the number is already known.
+        rows = [self._session(workspace="myrepo-123", pr_hint=123)]
+
+        with patch.object(luv, "run") as run:
+            luv.attach_pr_links(rows)
+
+        self.assertFalse(run.called)
+        self.assertEqual(rows[0]["pr_url"], "https://github.com/acme/myrepo/pull/123")
+
+    def test_sessions_without_a_workspace_number_are_skipped(self):
+        rows = [self._session(workspace=None), self._session(org=None)]
+
+        with patch.object(luv, "run") as run:
+            self.assertFalse(luv.attach_pr_links(rows))
+
+        self.assertFalse(run.called)
+        self.assertNotIn("pr_url", rows[0])
+
+    def test_missing_gh_keeps_the_cached_link(self):
+        rows = [self._session(pr_number=42, pr_url="https://x/42", pr_checked=0)]
+        err = io.StringIO()
+
+        with (patch.object(luv.shutil, "which", return_value=None),
+              patch.object(luv, "run") as run,
+              contextlib.redirect_stderr(err)):
+            luv.attach_pr_links(rows)
+
+        self.assertFalse(run.called)
+        self.assertEqual(rows[0]["pr_url"], "https://x/42")
+        self.assertIn("gh", err.getvalue())
+
+    def test_gh_failure_leaves_no_link(self):
+        rows = [self._session()]
+
+        with patch.object(luv, "run", return_value=_completed("", 1, "boom")):
+            luv.attach_pr_links(rows)
+
+        self.assertIsNone(rows[0]["pr_url"])
+
+    def test_timeout_is_a_failure_not_an_exception(self):
+        with patch.object(luv.subprocess, "run",
+                          side_effect=subprocess.TimeoutExpired("gh", 10)):
+            r = luv.run(["gh", "api", "whatever"], timeout=10)
+
+        self.assertNotEqual(r.returncode, 0)
+
+
+class SessionTableTests(unittest.TestCase):
+    """The link has to survive both a terminal and a pipe."""
+
+    ROWS = [
+        {"host": "box", "session": "luv-myrepo-42", "workspace": "myrepo-42",
+         "agent": "claude", "live": True, "attached": True, "prompt": "fix it",
+         "pr_number": 42, "pr_url": "https://github.com/acme/myrepo/pull/42"},
+        {"host": "box", "session": "luv-myrepo-51", "workspace": "myrepo-51",
+         "agent": "codex", "live": True, "attached": False, "prompt": "add limits"},
+    ]
+
+    def _render(self, tty):
+        out = io.StringIO()
+        out.isatty = lambda: tty
+        with contextlib.redirect_stdout(out):
+            luv.print_sessions(self.ROWS)
+        return out.getvalue().splitlines()
+
+    def test_piped_output_shows_the_full_url(self):
+        lines = self._render(tty=False)
+
+        self.assertIn("PR", lines[0])
+        self.assertIn("https://github.com/acme/myrepo/pull/42", lines[1])
+        self.assertNotIn("\033", lines[1], "escapes would corrupt a redirect")
+
+    def test_terminal_output_hyperlinks_a_short_number(self):
+        lines = self._render(tty=True)
+
+        self.assertIn("\033]8;;https://github.com/acme/myrepo/pull/42\033\\#42", lines[1])
+
+    def test_columns_stay_aligned_around_the_escape(self):
+        # The link's escape bytes must not enter the width arithmetic: the
+        # PROMPT column has to start at the same offset on every row.
+        lines = self._render(tty=True)
+        visible = [re.sub(r"\033]8;;[^\033]*\033\\", "", line) for line in lines]
+
+        self.assertEqual(visible[0].index("PROMPT"), visible[1].index("fix it"))
+        self.assertEqual(visible[1].index("fix it"), visible[2].index("add limits"))
+
+    def test_session_without_a_pr_shows_a_dash(self):
+        lines = self._render(tty=True)
+
+        self.assertRegex(lines[2], r"\s-\s+add limits$")
 
 
 if __name__ == "__main__":

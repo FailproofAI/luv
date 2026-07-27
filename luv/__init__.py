@@ -47,8 +47,15 @@ def die(msg: str) -> None:
     sys.exit(1)
 
 
-def run(cmd: list[str], *, cwd: str | None = None) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
+def run(cmd: list[str], *, cwd: str | None = None,
+        timeout: float | None = None) -> subprocess.CompletedProcess:
+    """Capture a subprocess. A timeout surfaces as a failure, not an exception,
+    so callers keep their plain returncode checks."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, cwd=cwd,
+                              timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(cmd, 124, "", f"timed out after {timeout}s")
 
 
 def load_config() -> dict:
@@ -365,6 +372,16 @@ def parse_github_remote(cwd: str) -> tuple[str, str] | None:
     if m:
         return m.group(1), m.group(2)
     return None
+
+
+def workspace_number(name: str | None) -> int | None:
+    """The trailing N of a '{repo}-{N}' workspace folder, or None if it isn't one."""
+    if not name:
+        return None
+    parts = name.rsplit("-", 1)
+    if len(parts) != 2 or not parts[1].isdigit():
+        return None
+    return int(parts[1])
 
 
 def resolve_org(explicit: str | None = None) -> str:
@@ -951,8 +968,8 @@ def cmd_clean(force: bool = False, safe: bool = False) -> None:
         if not entry.is_dir():
             continue
 
-        parts = entry.name.rsplit("-", 1)
-        if len(parts) != 2 or not parts[1].isdigit():
+        number = workspace_number(entry.name)
+        if number is None:
             continue  # doesn't match {repo}-{number} — skip silently
 
         if tmux_session_name(entry.name) in live:
@@ -967,8 +984,7 @@ def cmd_clean(force: bool = False, safe: bool = False) -> None:
             cleaned.append(entry.name)
             continue
 
-        number_str = parts[1]
-        branch = f"luv-{number_str}"
+        branch = f"luv-{number}"
         cwd = str(entry)
 
         # Must be a git repo
@@ -1232,6 +1248,105 @@ def relative_age(ts: int | None) -> str:
     return f"{delta}s ago"
 
 
+PR_TTL_OK = 300      # a PR we already found changes slowly
+PR_TTL_MISS = 60     # no PR yet — the agent may open one any minute
+PR_TIMEOUT = 10      # never let a wedged gh hang `luv ls`
+PR_KEYS = ("pr_number", "pr_url", "pr_checked")  # cached in sessions.json
+
+
+def fetch_pr(org: str, repo: str, number: int) -> dict | None:
+    """The PR for workspace {repo}-{number}, found by its luv-{number} branch.
+
+    Deliberately a head query and nothing else: asking whether PR #number exists
+    would happily return a stranger's PR whenever someone took that number
+    between luv reserving the folder and the agent pushing. Sessions opened from
+    an existing PR carry pr_hint instead — see attach_pr_links.
+    """
+    r = run(["gh", "api", f"repos/{org}/{repo}/pulls",
+             "-f", "state=all", "-f", f"head={org}:luv-{number}",
+             "-f", "per_page=1", "-f", "sort=created", "-f", "direction=desc"],
+            timeout=PR_TIMEOUT)
+    if r.returncode != 0:
+        return None
+    try:
+        prs = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(prs, list) or not prs:
+        return None
+    pr = prs[0]
+    if not pr.get("html_url"):
+        return None
+    return {"number": pr.get("number"), "url": pr["html_url"]}
+
+
+def attach_pr_links(rows: list[dict]) -> bool:
+    """Fill in pr_number/pr_url on each session, re-asking GitHub past the TTL.
+
+    Mutates the entries in place and reports whether anything changed, so the
+    caller only pays for a write when there is something new. The cache is what
+    keeps repeat `luv ls` runs instant and keeps a link on screen when GitHub
+    (or the network) is unavailable.
+    """
+    now = int(time.time())
+    changed = False
+    stale = []
+    for s in rows:
+        org, repo = s.get("org"), s.get("repo")
+        # Opened from a known PR (-l / -pr): the number is already right and its
+        # head ref isn't luv-N, so resolve it without touching the network.
+        hint = s.get("pr_hint")
+        if hint and org and repo:
+            url = f"https://github.com/{org}/{repo}/pull/{hint}"
+            changed = changed or s.get("pr_url") != url
+            s["pr_number"], s["pr_url"], s["pr_checked"] = hint, url, now
+            continue
+        number = workspace_number(s.get("workspace"))
+        if not (org and repo and number is not None):
+            continue
+        ttl = PR_TTL_OK if s.get("pr_url") else PR_TTL_MISS
+        if now - int(s.get("pr_checked") or 0) < ttl:
+            continue
+        stale.append((s, org, repo, number))
+
+    if not stale:
+        return changed
+    if not shutil.which("gh"):
+        print("luv: warning: 'gh' not found — PR column shows last known state",
+              file=sys.stderr)
+        return changed
+
+    def probe(item: tuple) -> dict | None:
+        _, org, repo, number = item
+        return fetch_pr(org, repo, number)
+
+    if len(stale) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(8, len(stale))) as pool:
+            found = list(pool.map(probe, stale))
+    else:
+        found = [probe(stale[0])]
+
+    for (s, *_), pr in zip(stale, found):
+        s["pr_number"] = pr["number"] if pr else None
+        s["pr_url"] = pr["url"] if pr else None
+        s["pr_checked"] = now
+    return True
+
+
+def hyperlink(url: str | None, label: str) -> str:
+    """OSC 8 hyperlink, so a short '#37' is still clickable.
+
+    Off a terminal the escapes would be noise and the number alone useless, so
+    piped output gets the bare URL instead.
+    """
+    if not url:
+        return label
+    if not sys.stdout.isatty():
+        return url
+    return f"\033]8;;{url}\033\\{label}\033]8;;\033\\"
+
+
 def refresh_sessions(identity: str | None = None) -> tuple[list[dict], set[str]]:
     """Reconcile and persist the registry, warning about unreachable hosts."""
     with session_lock():
@@ -1249,9 +1364,18 @@ def session_sort_key(s: dict) -> int:
 
 def print_sessions(rows: list[dict]) -> None:
     """Print the session table, truncating the prompt to the terminal width."""
-    headers = ("HOST", "SESSION", "WORKSPACE", "AGENT", "ATTACHED", "ACTIVE", "PROMPT")
-    table = []
+    headers = ("HOST", "SESSION", "WORKSPACE", "AGENT", "ATTACHED", "ACTIVE",
+               "PR", "PROMPT")
+    last = len(headers) - 1  # PROMPT is the elastic column: truncated, not padded
+    pr_col = last - 1
+    table, links = [], []
     for s in rows:
+        url = s.get("pr_url")
+        # A terminal can hyperlink, so '#37' says it in four columns; piped
+        # output has nothing to click and gets the URL itself.
+        pr = f"#{s['pr_number']}" if url and s.get("pr_number") and sys.stdout.isatty() \
+            else (url or "-")
+        links.append(url)
         table.append((
             s.get("host") or "local",
             s.get("session") or "-",
@@ -1259,15 +1383,21 @@ def print_sessions(rows: list[dict]) -> None:
             s.get("agent") or "-",
             "?" if s.get("live") is None else ("yes" if s.get("attached") else "no"),
             relative_age(session_sort_key(s)),
+            pr,
             (s.get("prompt") or "-").replace("\n", " "),
         ))
-    widths = [max(len(headers[i]), max(len(r[i]) for r in table)) for i in range(6)]
+    widths = [max(len(headers[i]), max(len(r[i]) for r in table)) for i in range(last)]
     used = sum(widths) + 2 * len(widths)
     room = max(12, shutil.get_terminal_size((100, 24)).columns - used)
-    print("  ".join(headers[i].ljust(widths[i]) for i in range(6)) + "  " + headers[6])
-    for row in table:
-        prompt = row[6] if len(row[6]) <= room else row[6][:room - 1] + "…"
-        print("  ".join(row[i].ljust(widths[i]) for i in range(6)) + "  " + prompt)
+    print("  ".join(headers[i].ljust(widths[i]) for i in range(last))
+          + "  " + headers[last])
+    for row, url in zip(table, links):
+        cells = [row[i].ljust(widths[i]) for i in range(last)]
+        # Pad outside the escape so the link covers '#37', not trailing spaces.
+        cells[pr_col] = (hyperlink(url, row[pr_col])
+                         + " " * (widths[pr_col] - len(row[pr_col])))
+        prompt = row[last] if len(row[last]) <= room else row[last][:room - 1] + "…"
+        print("  ".join(cells) + "  " + prompt)
 
 
 def cmd_ls(args: list[str], identity: str | None = None) -> None:
@@ -1296,6 +1426,17 @@ def cmd_ls(args: list[str], identity: str | None = None) -> None:
     if not rows:
         print("luv: no sessions")
         return
+    if "--no-pr" not in args and attach_pr_links(rows):
+        # Re-read under the lock rather than writing back the list we already
+        # have: a concurrent dispatch may have appended an entry since
+        # refresh_sessions released it. Only the pr_* keys are ours to merge.
+        cached = {s["id"]: {k: s.get(k) for k in PR_KEYS} for s in rows if s.get("id")}
+        with session_lock():
+            stored = load_sessions()
+            for s in stored:
+                if s.get("id") in cached:
+                    s.update(cached[s["id"]])
+            save_sessions(stored)
     rows.sort(key=session_sort_key, reverse=True)
     print_sessions(rows)
 
@@ -1418,7 +1559,7 @@ Commands:
   luv config set|get|unset <key> [value]  read or write a single setting
   luv config list                         show all settings
   luv --init                              configure default GitHub org only
-  luv ls [--host H] [--prune]             list live sessions across hosts
+  luv ls [--host H] [--prune] [--no-pr]   list live sessions across hosts
   luv continue [<repo> [number]]          attach to a live session
   luv [org/]<repo> [prompt...]            create a new PR workspace
   luv [org/]<repo> -b <branch> [prompt]   create a workspace based off <branch>
@@ -1494,15 +1635,20 @@ Docker:
 
         # The workspace folder is {repo}-{number}, so for these forms the tmux
         # session name is knowable now and 'new-session -A' doubles as attach.
+        # -l and -pr also pin down the PR itself, which `luv ls` can't otherwise
+        # find: their branch is the PR's head ref, not luv-{number}.
+        pr_hint = None
         if args[0] == "-l" and len(args) > 1:
             m = re.match(r"https://github\.com/([^/]+)/([^/]+)/pull/(\d+)", args[1])
             if m:
                 org_hint, repo_hint = m.group(1), m.group(2)
-                workspace = f"{repo_hint}-{int(m.group(3))}"
+                pr_hint = int(m.group(3))
+                workspace = f"{repo_hint}-{pr_hint}"
         elif repo_hint and "-pr" in args:
             idx = args.index("-pr")
             if idx + 1 < len(args) and args[idx + 1].isdigit():
-                workspace = f"{repo_hint}-{int(args[idx + 1])}"
+                pr_hint = int(args[idx + 1])
+                workspace = f"{repo_hint}-{pr_hint}"
         elif repo_hint and len(args) > 1 and args[1].isdigit():
             workspace = f"{repo_hint}-{int(args[1])}"
 
@@ -1524,7 +1670,7 @@ Docker:
         meta = None
         if use_tmux:
             meta = {"org": org_hint, "repo": repo_hint, "agent": agent,
-                    "prompt": prompt_text}
+                    "prompt": prompt_text, "pr_hint": pr_hint}
             if workspace and prompt_text:
                 print(f"luv: note: if {tmux_session_name(workspace)} is already "
                       "running, luv attaches to it and this prompt is not sent",

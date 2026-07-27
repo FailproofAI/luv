@@ -36,7 +36,10 @@ the session (which luv does as soon as the clone lands) breaks nothing.
       "agent": "claude",
       "prompt": "fix the flaky test",
       "created": 1753401234,
-      "last_seen": 1753408899
+      "last_seen": 1753408899,
+      "pr_number": 42,
+      "pr_url": "https://github.com/exosphere/myrepo/pull/42",
+      "pr_checked": 1753408899
     }
   ]
 }
@@ -53,6 +56,9 @@ the session (which luv does as soon as the clone lands) breaks nothing.
 | `prompt` | The prompt you launched with, for the `luv ls` label |
 | `created` | Unix time the entry was written |
 | `last_seen` | Unix time of the last successful reconcile |
+| `pr_number`, `pr_url` | The session's pull request; `null` until one exists |
+| `pr_checked` | Unix time GitHub was last asked about it |
+| `pr_hint` | PR number known at dispatch (`-l` / `-pr` only); absent otherwise |
 
 `attached`, `activity`, and `live` are recomputed on every reconcile and are
 deliberately **not** written back to the file.
@@ -92,6 +98,44 @@ luv ls --prune
 
 That drops entries for hosts that didn't answer, in addition to the dead ones
 reconciliation already removed.
+
+## PR links
+
+Every luv workspace is one pull request by construction — folder `{repo}-{N}`,
+branch `luv-{N}` — so `luv ls` can show the PR each session is producing:
+
+```
+HOST  SESSION         WORKSPACE   AGENT   ATTACHED  ACTIVE  PR    PROMPT
+box   luv-myrepo-42   myrepo-42   claude  yes       2m ago  #42   fix the flaky test
+box   luv-myrepo-51   myrepo-51   codex   no        1h ago  -     add rate limiting
+```
+
+`#42` is an OSC 8 terminal hyperlink, so ctrl/cmd-click opens the PR. When
+stdout isn't a terminal there's nothing to click and a bare number would be
+useless, so `luv ls | grep` and redirects get the full URL instead.
+
+The lookup asks GitHub for the PR whose head is `{org}:luv-{N}`:
+
+```
+gh api repos/{org}/{repo}/pulls -f state=all -f head={org}:luv-{N}
+```
+
+It is a head query and nothing else. Checking whether PR `#N` merely *exists*
+would show a stranger's PR whenever someone took that number between luv
+reserving the folder and the agent pushing — the folder number is only ever the
+*intended* PR number. Sessions started from an existing PR (`luv -l <url>`,
+`luv <repo> -pr <N>`) are the exception: there the number is known at dispatch
+and stored as `pr_hint`, so they resolve with no network call at all. Their
+branch is the PR's own head ref, which the head query would never match.
+
+Results are cached in the registry so repeat runs are instant and a link stays
+on screen when GitHub is unreachable — 5 minutes for a PR that was found, 1
+minute when there wasn't one yet (the agent may open it any moment). A session
+with no PR, no org, or a folder that isn't `{repo}-{N}` shows `-`.
+
+`luv ls --no-pr` skips the whole thing for a fast, offline-safe listing, which
+is also what happens automatically when `gh` isn't installed. `luv continue`
+renders the cached links but never triggers a lookup of its own.
 
 ## Concurrency
 

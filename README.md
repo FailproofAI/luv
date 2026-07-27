@@ -76,7 +76,7 @@ With a remote host configured, steps 1–4 happen on that machine inside a tmux 
 | `luv config set\|get\|unset <key> [value]` | Read or write a single setting |
 | `luv config list` | Show all settings |
 | `luv --init` | Configure default GitHub org only |
-| `luv ls [--host H] [--prune]` | List live sessions across hosts |
+| `luv ls [--host H] [--prune] [--no-pr]` | List live sessions across hosts, with each one's PR link |
 | `luv continue [<repo> [number]]` | Attach to a live session |
 | `luv [org/]<repo> [prompt...]` | Create a new workspace and launch Claude (default) |
 | `luv --codex [org/]<repo> [prompt...]` | Create a workspace and launch Codex in YOLO mode |
