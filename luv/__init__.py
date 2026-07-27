@@ -1251,7 +1251,7 @@ def relative_age(ts: int | None) -> str:
 PR_TTL_OK = 300      # a PR we already found changes slowly
 PR_TTL_MISS = 60     # no PR yet — the agent may open one any minute
 PR_TIMEOUT = 10      # never let a wedged gh hang `luv ls`
-PR_KEYS = ("pr_number", "pr_url", "pr_checked")  # cached in sessions.json
+PR_KEYS = ("pr_number", "pr_url", "pr_state", "pr_checked")  # cached in sessions.json
 
 
 def fetch_pr(org: str, repo: str, number: int) -> dict | None:
@@ -1269,7 +1269,7 @@ def fetch_pr(org: str, repo: str, number: int) -> dict | None:
     """
     r = run(["gh", "pr", "list", "--repo", f"{org}/{repo}",
              "--head", f"luv-{number}", "--state", "all", "--limit", "1",
-             "--json", "number,url"], timeout=PR_TIMEOUT)
+             "--json", "number,url,state"], timeout=PR_TIMEOUT)
     if r.returncode != 0:
         return None
     try:
@@ -1278,7 +1278,8 @@ def fetch_pr(org: str, repo: str, number: int) -> dict | None:
         return None
     if not isinstance(prs, list) or not prs or not prs[0].get("url"):
         return None
-    return {"number": prs[0].get("number"), "url": prs[0]["url"]}
+    return {"number": prs[0].get("number"), "url": prs[0]["url"],
+            "state": prs[0].get("state")}
 
 
 def attach_pr_links(rows: list[dict]) -> bool:
@@ -1301,6 +1302,7 @@ def attach_pr_links(rows: list[dict]) -> bool:
             url = f"https://github.com/{org}/{repo}/pull/{hint}"
             changed = changed or s.get("pr_url") != url
             s["pr_number"], s["pr_url"], s["pr_checked"] = hint, url, now
+            s.setdefault("pr_state", None)  # only the head query reports state
             continue
         number = workspace_number(s.get("workspace"))
         if not (org and repo and number is not None):
@@ -1331,6 +1333,7 @@ def attach_pr_links(rows: list[dict]) -> bool:
     for (s, *_), pr in zip(stale, found):
         s["pr_number"] = pr["number"] if pr else None
         s["pr_url"] = pr["url"] if pr else None
+        s["pr_state"] = pr["state"] if pr else None
         s["pr_checked"] = now
     return True
 
@@ -1440,6 +1443,194 @@ def cmd_ls(args: list[str], identity: str | None = None) -> None:
             save_sessions(stored)
     rows.sort(key=session_sort_key, reverse=True)
     print_sessions(rows)
+
+
+def remote_prs_dir(hc: dict | None) -> str:
+    """The workspace root on a host, as one shell word for the remote side.
+
+    Unconfigured hosts get $HOME/prs expanded there rather than here — the
+    laptop's home directory is not the box's.
+    """
+    if hc is None:
+        return shlex.quote(str(PRS_DIR))
+    if hc.get("dir"):
+        return shlex.quote(str(hc["dir"]))
+    return '"$HOME/prs"'
+
+
+def rm_workspace(hc: dict | None, session: str | None, workspace: str) -> str | None:
+    """Kill the tmux session and delete its folder on `hc`. Returns an error.
+
+    The workspace name is checked against {repo}-{N} before it goes anywhere
+    near `rm -rf`: this runs unattended, over ssh, against a directory full of
+    other people's work.
+    """
+    if workspace_number(workspace) is None:
+        return f"'{workspace}' is not a {{repo}}-{{N}} workspace"
+    steps = []
+    if session:
+        steps.append(f"tmux kill-session -t {shlex.quote(session)} 2>/dev/null")
+    steps.append(f"rm -rf -- {remote_prs_dir(hc)}/{shlex.quote(workspace)}")
+    r = ssh_run(hc, "; ".join(steps))
+    if hc is not None and r.returncode == 255:
+        return "host unreachable"
+    if r.returncode != 0:
+        return r.stderr.strip().splitlines()[-1] if r.stderr.strip() else "delete failed"
+    return None
+
+
+def workspace_exists(hc: dict | None, workspace: str) -> bool | None:
+    """Whether the folder is on the host. None when the host never answered."""
+    r = ssh_run(hc, f"test -d {remote_prs_dir(hc)}/{shlex.quote(workspace)}")
+    if hc is not None and r.returncode == 255:
+        return None
+    return r.returncode == 0
+
+
+def orphan_workspaces(hc: dict | None) -> list[str] | None:
+    """Workspace folders on a host with no live luv session. None if unreachable.
+
+    These are what `luv ls` cannot show: reconciliation drops a registry entry
+    the moment its tmux session dies, but the clone it left behind stays on the
+    remote disk forever.
+    """
+    live = query_tmux(hc)
+    if live is None:
+        return None
+    r = ssh_run(hc, f"ls -1 -- {remote_prs_dir(hc)} 2>/dev/null")
+    if hc is not None and r.returncode == 255:
+        return None
+    running = {t["workspace"] for t in live if t["workspace"]} | {t["session"] for t in live}
+    folders = [f.strip() for f in r.stdout.splitlines() if f.strip()]
+    return [f for f in folders
+            if workspace_number(f) is not None
+            and f not in running and tmux_session_name(f) not in running]
+
+
+def known_hosts(sessions: list[dict], host_filter: str | None) -> list[str]:
+    """Hosts worth scanning: the registry's, the default one, and always local.
+
+    Local stays in the set even when a remote is configured — `--local` runs and
+    pre-remote workspaces still leave folders in this machine's PRS_DIR, and an
+    empty registry must not mean "nowhere to look".
+    """
+    hosts = {s.get("host") or "" for s in sessions} | {""}
+    remote = load_config().get("remote")
+    if isinstance(remote, dict) and remote.get("host"):
+        hosts.add(remote["host"])
+    if host_filter is not None:
+        hosts &= {host_filter}
+    return sorted(hosts)
+
+
+def cmd_rm(args: list[str], identity: str | None = None, force: bool = False) -> None:
+    """Tear a session down: kill its tmux, delete its folder, forget the entry."""
+    host_filter = None
+    if "--host" in args:
+        idx = args.index("--host")
+        if idx + 1 >= len(args):
+            die("--host requires a host name")
+        host_filter = args[idx + 1]
+        args = args[:idx] + args[idx + 2:]
+
+    merged, dead = "--merged" in args, "--dead" in args
+    targets = [a for a in args if not a.startswith("-")]
+    if not (targets or merged or dead):
+        die("usage: luv rm <session|workspace>... | --merged | --dead [--host H]")
+
+    sessions, _ = refresh_sessions(identity)
+    scope = [s for s in sessions if host_filter is None or s.get("host") == host_filter]
+
+    # (host, session, workspace, label) — session is None for an orphaned folder.
+    doomed: list[tuple[str, str | None, str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def take(host: str, session: str | None, workspace: str | None, label: str) -> None:
+        if not workspace or (host, workspace) in seen:
+            return
+        seen.add((host, workspace))
+        doomed.append((host, session, workspace, label))
+
+    for target in targets:
+        hits = [s for s in scope if target in (s.get("session"), s.get("workspace"))]
+        if hits:
+            for s in hits:
+                take(s.get("host") or "", s.get("session"), s.get("workspace"), "named")
+            continue
+        # Reconciliation drops an entry the moment its tmux session dies, so a
+        # finished session — the usual thing you want gone — has already left
+        # the registry by the time we look. Fall back to the folder itself.
+        # 'luv-myrepo-2' is both a plausible session name and a plausible
+        # {repo}-{N}, so try it verbatim before trying it as a session name.
+        candidates = [target] + ([target[4:]] if target.startswith("luv-") else [])
+        found = False
+        for folder in [c for c in candidates if workspace_number(c) is not None]:
+            for host in known_hosts(sessions, host_filter):
+                hc = resolve_host(host, identity) if host else None
+                if workspace_exists(hc, folder):
+                    take(host, tmux_session_name(folder), folder, "named")
+                    found = True
+            if found:
+                break
+        if not found:
+            die(f"no session or workspace matching '{target}'"
+                + (f" on {host_filter}" if host_filter else ""))
+
+    if merged:
+        attach_pr_links(scope)
+        for s in scope:
+            if (s.get("pr_state") or "").upper() == "MERGED":
+                take(s.get("host") or "", s.get("session"), s.get("workspace"),
+                     f"PR #{s.get('pr_number')} merged")
+
+    if dead:
+        for host in known_hosts(sessions, host_filter):
+            hc = resolve_host(host, identity) if host else None
+            orphans = orphan_workspaces(hc)
+            if orphans is None:
+                print(f"luv: warning: {host or 'local'} unreachable — skipped",
+                      file=sys.stderr)
+                continue
+            for folder in orphans:
+                take(host, None, folder, "no live session")
+
+    if not doomed:
+        print("luv: nothing to remove")
+        return
+
+    # An explicit target is its own confirmation; a selector is not — it can
+    # sweep up folders on machines you are not looking at.
+    if (merged or dead) and not force:
+        print(f"luv: about to remove {len(doomed)} workspace"
+              f"{'' if len(doomed) == 1 else 's'}:")
+        for host, session, workspace, label in doomed:
+            print(f"  {host or 'local'}  {workspace}  ({label})")
+        if (input("Proceed? [y/N]: ").strip().lower() or "n") not in ("y", "yes"):
+            print("luv: aborted")
+            return
+
+    removed, failed = [], []
+    for host, session, workspace, _ in doomed:
+        hc = resolve_host(host, identity) if host else None
+        err = rm_workspace(hc, session, workspace)
+        if err:
+            failed.append((host, workspace, err))
+        else:
+            removed.append((host, workspace))
+            print(f"luv: {host or 'local'} — removed {workspace}")
+
+    gone = {(h, w) for h, w in removed}
+    with session_lock():
+        keep = [s for s in load_sessions()
+                if ((s.get("host") or ""), s.get("workspace")) not in gone]
+        save_sessions(keep)
+
+    if failed:
+        print("luv: failed:")
+        for host, workspace, err in failed:
+            print(f"  {host or 'local'} {workspace}: {err}")
+    print(f"luv: removed {len(removed)} workspace"
+          f"{'' if len(removed) == 1 else 's'}")
 
 
 def cmd_continue(args: list[str], identity: str | None = None) -> None:
@@ -1553,6 +1744,7 @@ Flags:
   -i PATH       SSH identity file to use for this invocation
   --local       force local execution even when a remote host is configured
   -f, --force   (with --clean) skip safety checks and delete all work folders
+                (with rm --merged/--dead) skip the confirmation prompt
   --safe        (with --clean -f) only delete folders older than 24h
 
 Commands:
@@ -1562,6 +1754,9 @@ Commands:
   luv --init                              configure default GitHub org only
   luv ls [--host H] [--prune] [--no-pr]   list live sessions across hosts
   luv continue [<repo> [number]]          attach to a live session
+  luv rm <session|workspace>...           kill a session and delete its folder
+  luv rm --merged [--host H] [-f]         remove every session whose PR is merged
+  luv rm --dead [--host H] [-f]           remove workspaces with no live session
   luv [org/]<repo> [prompt...]            create a new PR workspace
   luv [org/]<repo> -b <branch> [prompt]   create a workspace based off <branch>
   luv [org/]<repo> <number> [prompt]      reopen an existing work folder by number
@@ -1603,6 +1798,10 @@ Docker:
 
     if args[0] == "continue":
         cmd_continue(args[1:], identity)
+        return
+
+    if args[0] == "rm":
+        cmd_rm(args[1:], identity, force=force)
         return
 
     if safe and (args[0] != "--clean" or not force):

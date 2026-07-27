@@ -570,6 +570,233 @@ class PrLinkTests(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
 
 
+class RmWorkspaceTests(unittest.TestCase):
+    """`luv rm` runs rm -rf over ssh. The guardrails are the feature."""
+
+    def test_refuses_a_name_that_is_not_a_workspace(self):
+        for bad in ("../../etc", "myrepo", "", "*"):
+            with patch.object(luv, "ssh_run") as ssh:
+                err = luv.rm_workspace({"host": "box"}, "luv-x", bad)
+            self.assertIsNotNone(err, f"{bad!r} must be refused")
+            self.assertFalse(ssh.called, f"{bad!r} must not reach the remote")
+
+    def test_kills_tmux_then_deletes_the_folder(self):
+        with patch.object(luv, "ssh_run", return_value=_completed()) as ssh:
+            err = luv.rm_workspace({"host": "box"}, "luv-myrepo-42", "myrepo-42")
+
+        self.assertIsNone(err)
+        cmd = ssh.call_args.args[1]
+        self.assertIn("tmux kill-session -t luv-myrepo-42", cmd)
+        self.assertIn('rm -rf -- "$HOME/prs"/myrepo-42', cmd)
+        self.assertLess(cmd.index("kill-session"), cmd.index("rm -rf"))
+
+    def test_home_is_expanded_on_the_remote_not_here(self):
+        # The laptop's home directory is not the box's.
+        with patch.object(luv, "ssh_run", return_value=_completed()) as ssh:
+            luv.rm_workspace({"host": "box"}, None, "myrepo-42")
+
+        self.assertIn('"$HOME/prs"', ssh.call_args.args[1])
+
+    def test_uses_the_hosts_configured_dir(self):
+        with patch.object(luv, "ssh_run", return_value=_completed()) as ssh:
+            luv.rm_workspace({"host": "gpu", "dir": "/scratch/prs"}, None, "myrepo-42")
+
+        self.assertIn("rm -rf -- /scratch/prs/myrepo-42", ssh.call_args.args[1])
+
+    def test_unreachable_host_is_reported_not_swallowed(self):
+        with patch.object(luv, "ssh_run", return_value=_completed("", 255)):
+            err = luv.rm_workspace({"host": "box"}, "luv-myrepo-42", "myrepo-42")
+
+        self.assertEqual(err, "host unreachable")
+
+    def test_orphans_are_folders_with_no_live_session(self):
+        live = "abc|luv-myrepo-42|myrepo-42|0|1700000000\n"
+        listing = "myrepo-42\nmyrepo-9\nnotes\n"
+
+        with patch.object(luv, "ssh_run",
+                          side_effect=[_completed(live), _completed(listing)]):
+            orphans = luv.orphan_workspaces({"host": "box"})
+
+        self.assertEqual(orphans, ["myrepo-9"], "live folder and non-workspace kept")
+
+    def test_unreachable_host_yields_no_orphans(self):
+        with patch.object(luv, "ssh_run", return_value=_completed("", 255)):
+            self.assertIsNone(luv.orphan_workspaces({"host": "box"}))
+
+
+class CmdRmTests(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        root = Path(self.tempdir.name)
+        for p in (patch.object(luv, "LUV_DIR", root),
+                  patch.object(luv, "SESSIONS_FILE", root / "sessions.json"),
+                  patch.object(luv, "SESSIONS_LOCK", root / "sessions.lock"),
+                  patch.object(luv, "load_config", return_value=REMOTE_CONFIG)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    @staticmethod
+    def _entry(**over):
+        e = {"id": "a", "host": "box", "session": "luv-myrepo-42",
+             "workspace": "myrepo-42", "org": "acme", "repo": "myrepo"}
+        e.update(over)
+        return e
+
+    @contextlib.contextmanager
+    def _run_rm(self, rows, answer=None):
+        """Drive cmd_rm with a fixed registry and a stubbed remote."""
+        with (patch.object(luv, "refresh_sessions", return_value=(rows, set())),
+              patch.object(luv, "attach_pr_links", return_value=False),
+              # No test here may reach a real host: the folder-scan fallback
+              # would otherwise ssh to whatever REMOTE_CONFIG names.
+              patch.object(luv, "workspace_exists", return_value=False),
+              patch.object(luv, "rm_workspace", return_value=None) as rm,
+              patch("builtins.input", return_value=answer or ""),
+              contextlib.redirect_stdout(io.StringIO()),
+              contextlib.redirect_stderr(io.StringIO())):
+            yield rm
+
+    def test_named_target_removes_and_forgets_the_entry(self):
+        luv.save_sessions([self._entry()])
+
+        with self._run_rm([self._entry()]) as rm:
+            luv.cmd_rm(["myrepo-42"])
+
+        self.assertEqual(rm.call_args.args[2], "myrepo-42")
+        self.assertEqual(luv.load_sessions(), [], "registry entry must be dropped")
+
+    def test_session_name_also_matches(self):
+        with self._run_rm([self._entry()]) as rm:
+            luv.cmd_rm(["luv-myrepo-42"])
+
+        self.assertTrue(rm.called)
+
+    def test_named_target_needs_no_confirmation(self):
+        with self._run_rm([self._entry()]) as rm:
+            with patch("builtins.input", side_effect=AssertionError("must not prompt")):
+                luv.cmd_rm(["myrepo-42"])
+
+        self.assertTrue(rm.called)
+
+    def test_a_finished_session_is_found_by_folder_scan(self):
+        # Reconciliation already dropped the entry, which is precisely the case
+        # you reach for `luv rm` in. The folder is still on disk.
+        with (patch.object(luv, "refresh_sessions", return_value=([], set())),
+              patch.object(luv, "workspace_exists", side_effect=lambda hc, w: hc is None),
+              patch.object(luv, "rm_workspace", return_value=None) as rm,
+              contextlib.redirect_stdout(io.StringIO())):
+            luv.cmd_rm(["myrepo-42"])
+
+        self.assertEqual(rm.call_args.args[2], "myrepo-42")
+        self.assertEqual(rm.call_args.args[1], "luv-myrepo-42", "kill its tmux too")
+
+    def test_session_name_form_resolves_to_the_folder(self):
+        # 'luv-myrepo-2' parses as a {repo}-{N} in its own right, so the luv-
+        # prefix has to be tried as a fallback rather than stripped up front.
+        exists = lambda hc, w: hc is None and w == "myrepo-2"
+
+        with (patch.object(luv, "refresh_sessions", return_value=([], set())),
+              patch.object(luv, "workspace_exists", side_effect=exists),
+              patch.object(luv, "rm_workspace", return_value=None) as rm,
+              contextlib.redirect_stdout(io.StringIO())):
+            luv.cmd_rm(["luv-myrepo-2"])
+
+        self.assertEqual(rm.call_args.args[2], "myrepo-2")
+
+    def test_a_folder_that_is_not_a_workspace_is_never_targeted(self):
+        # `test -d ~/prs/notes` succeeds; that must not make it a target.
+        with (patch.object(luv, "refresh_sessions", return_value=([], set())),
+              patch.object(luv, "workspace_exists", return_value=True),
+              patch.object(luv, "rm_workspace") as rm,
+              contextlib.redirect_stdout(io.StringIO()),
+              contextlib.redirect_stderr(io.StringIO())):
+            with self.assertRaises(SystemExit):
+                luv.cmd_rm(["notes"])
+
+        self.assertFalse(rm.called)
+
+    def test_unknown_target_is_an_error_and_removes_nothing(self):
+        with self._run_rm([]) as rm:
+            with self.assertRaises(SystemExit):
+                luv.cmd_rm(["myrepo-42"])
+
+        self.assertFalse(rm.called)
+
+    def test_a_failed_delete_keeps_the_registry_entry(self):
+        luv.save_sessions([self._entry()])
+
+        with (patch.object(luv, "refresh_sessions", return_value=([self._entry()], set())),
+              patch.object(luv, "rm_workspace", return_value="host unreachable"),
+              contextlib.redirect_stdout(io.StringIO())):
+            luv.cmd_rm(["myrepo-42"])
+
+        self.assertEqual(len(luv.load_sessions()), 1, "a failed delete must not forget")
+
+    def test_merged_selects_only_merged_prs(self):
+        rows = [self._entry(id="a", workspace="myrepo-1", pr_state="MERGED"),
+                self._entry(id="b", workspace="myrepo-2", pr_state="OPEN"),
+                self._entry(id="c", workspace="myrepo-3", pr_state=None)]
+
+        with self._run_rm(rows, answer="y") as rm:
+            luv.cmd_rm(["--merged"])
+
+        self.assertEqual([c.args[2] for c in rm.call_args_list], ["myrepo-1"])
+
+    def test_bulk_removal_aborts_unless_confirmed(self):
+        rows = [self._entry(workspace="myrepo-1", pr_state="MERGED")]
+
+        with self._run_rm(rows, answer="n") as rm:
+            luv.cmd_rm(["--merged"])
+
+        self.assertFalse(rm.called, "a bare Enter must not delete anything")
+
+    def test_force_skips_the_prompt(self):
+        rows = [self._entry(workspace="myrepo-1", pr_state="MERGED")]
+
+        with self._run_rm(rows) as rm:
+            with patch("builtins.input", side_effect=AssertionError("must not prompt")):
+                luv.cmd_rm(["--merged"], force=True)
+
+        self.assertTrue(rm.called)
+
+    def test_dead_skips_an_unreachable_host(self):
+        with (patch.object(luv, "refresh_sessions", return_value=([self._entry()], set())),
+              patch.object(luv, "orphan_workspaces", return_value=None),
+              patch.object(luv, "rm_workspace") as rm,
+              contextlib.redirect_stdout(io.StringIO()),
+              contextlib.redirect_stderr(io.StringIO())):
+            luv.cmd_rm(["--dead"], force=True)
+
+        self.assertFalse(rm.called, "an offline box must not be treated as empty")
+
+    def test_dead_removes_orphaned_folders(self):
+        with (patch.object(luv, "refresh_sessions", return_value=([self._entry()], set())),
+              patch.object(luv, "orphan_workspaces", return_value=["myrepo-9"]),
+              patch.object(luv, "rm_workspace", return_value=None) as rm,
+              contextlib.redirect_stdout(io.StringIO())):
+            luv.cmd_rm(["--dead"], force=True)
+
+        self.assertEqual(rm.call_args.args[2], "myrepo-9")
+        self.assertIsNone(rm.call_args.args[1], "an orphan has no session to kill")
+
+    def test_host_filter_scopes_the_selection(self):
+        rows = [self._entry(id="a", host="box", workspace="myrepo-1", pr_state="MERGED"),
+                self._entry(id="b", host="gpu", workspace="myrepo-2", pr_state="MERGED")]
+
+        with self._run_rm(rows, answer="y") as rm:
+            luv.cmd_rm(["--merged", "--host", "gpu"])
+
+        self.assertEqual([c.args[2] for c in rm.call_args_list], ["myrepo-2"])
+
+    def test_no_selector_and_no_target_is_an_error(self):
+        with self._run_rm([self._entry()]) as rm:
+            with self.assertRaises(SystemExit):
+                luv.cmd_rm([])
+
+        self.assertFalse(rm.called)
+
+
 class SessionTableTests(unittest.TestCase):
     """The link has to survive both a terminal and a pipe."""
 

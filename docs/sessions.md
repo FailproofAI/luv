@@ -39,6 +39,7 @@ the session (which luv does as soon as the clone lands) breaks nothing.
       "last_seen": 1753408899,
       "pr_number": 42,
       "pr_url": "https://github.com/exosphere/myrepo/pull/42",
+      "pr_state": "OPEN",
       "pr_checked": 1753408899
     }
   ]
@@ -57,6 +58,7 @@ the session (which luv does as soon as the clone lands) breaks nothing.
 | `created` | Unix time the entry was written |
 | `last_seen` | Unix time of the last successful reconcile |
 | `pr_number`, `pr_url` | The session's pull request; `null` until one exists |
+| `pr_state` | `OPEN`, `CLOSED` or `MERGED` — what `luv rm --merged` selects on |
 | `pr_checked` | Unix time GitHub was last asked about it |
 | `pr_hint` | PR number known at dispatch (`-l` / `-pr` only); absent otherwise |
 
@@ -141,6 +143,48 @@ with no PR, no org, or a folder that isn't `{repo}-{N}` shows `-`.
 `luv ls --no-pr` skips the whole thing for a fast, offline-safe listing, which
 is also what happens automatically when `gh` isn't installed. `luv continue`
 renders the cached links but never triggers a lookup of its own.
+
+## Removing sessions
+
+`luv rm` is the teardown counterpart to `luv ls`: it kills the tmux session and
+deletes the workspace folder on whichever host the session lives on, then drops
+the registry entry.
+
+```bash
+luv rm myrepo-42          # by workspace, or by session name
+luv rm --merged           # every session whose PR state is MERGED
+luv rm --dead             # workspaces on a host with no live luv session
+luv rm --dead --host box  # scope either selector to one machine
+```
+
+`--merged` reads the `pr_state` the PR lookup already caches, so "clean up
+what's landed" costs nothing beyond what `luv ls` was doing anyway.
+
+`--dead` exists because **reconciliation removes a registry entry the moment its
+tmux session dies, but nothing removes the clone**. Those folders are invisible
+to `luv ls` — the registry has already forgotten them — and they are usually
+what is actually consuming the remote's disk. Finding them means asking the host
+directly: `ls -1` the workspace root, `tmux list-sessions`, and take the
+difference.
+
+That same asymmetry is why a named target falls back to a folder scan. A session
+you have just finished with is exactly one whose entry reconciliation has
+already dropped, so looking only in the registry would fail for the most common
+case.
+
+Two things bound the damage:
+
+- Only names matching `{repo}-{N}` are eligible, checked again immediately
+  before the `rm -rf` rather than only at selection time. A stray directory in
+  the workspace root is never a candidate, and a target that resolves to one is
+  an error, not a deletion.
+- A named target is its own confirmation, but `--merged` and `--dead` print what
+  they matched and ask, because a selector can sweep up folders on a machine you
+  are not looking at. `-f` skips the prompt.
+
+A failed delete — unreachable host, permissions — leaves the registry entry in
+place, so the session doesn't silently disappear from `luv ls` while its files
+are still on disk.
 
 ## Concurrency
 
