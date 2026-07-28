@@ -343,6 +343,19 @@ happen. Type the prompt into the running agent instead.
 It shows the last known state rather than pruning; nothing is lost. When a host
 is gone for good, `luv ls --prune` forgets its entries.
 
+**Junk like `35;22;1M` appears at my prompt after a dropped connection**
+
+That's mouse-tracking reports. The remote tmux/agent turned mouse tracking on
+in *your* terminal and, having been killed along with the connection, never
+turned it off — so every mouse move now types coordinates at your shell.
+Bracketed paste (`200~` around pastes), a missing cursor, and a stuck
+alternate screen come from the same cause.
+
+luv now cleans this up itself: it stays alive as the parent of `ssh` and
+restores the terminal whatever happens to the connection. If you land in this
+state from something else, `reset` (or `stty sane` plus
+`printf '\033[?1003l\033[?1006l\033[?2004l'`) clears it.
+
 **A session is wedged**
 
 ```bash

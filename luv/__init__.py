@@ -12,6 +12,11 @@ import tempfile
 import time
 from pathlib import Path
 
+try:
+    import termios
+except ImportError:  # not POSIX — the ssh/tmux handoffs don't run there either
+    termios = None
+
 LUV_DIR = Path.home() / ".luv"
 CONFIG_FILE = LUV_DIR / "config.json"
 SESSIONS_FILE = LUV_DIR / "sessions.json"
@@ -1153,21 +1158,109 @@ def open_pr(org: str, repo: str, number: int, prompt: str | None, nav_mode: bool
         launch(clone_dir, prompt, plan_mode=plan_mode, non_interactive=non_interactive, extra_env=extra_env, model=model, agent=agent)
 
 
-def exec_ssh(hc: dict, remote_cmd: str, *, tty: bool = True) -> None:
-    """Hand the terminal to ssh, replacing this process.
+# Terminal modes a full-screen program switches on and is expected to switch
+# off again on its way out. A connection that dies mid-session never gets to,
+# and the leftovers are user-visible: mouse tracking turns every mouse move
+# into "35;22;1M" junk at the shell prompt, bracketed paste wraps pastes in
+# "200~", and the alternate screen swallows the scrollback.
+TERM_RESET = (
+    "\x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l"   # mouse tracking off
+    "\x1b[?1004l"                                    # focus reporting off
+    "\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l"   # mouse report encodings off
+    "\x1b[?2004l"                                    # bracketed paste off
+    "\x1b[?1049l"                                    # back to the primary screen
+    "\x1b[?1l\x1b>"                                  # normal cursor keys, keypad
+    "\x1b[r"                                         # full-height scroll region
+    "\x1b[?7h\x1b[4l\x1b[?25h\x1b[0m"                # wrap, replace, cursor, colours
+)
 
-    execv (rather than subprocess.run) is what gives correct TTY handling,
-    Ctrl-C, and exit-code passthrough for free — same as the local agent paths.
+
+def terminal_fd() -> int | None:
+    """The fd our terminal is on, or None when there isn't one.
+
+    stdin first: it is the one a redirect is least likely to have taken away,
+    and termios wants the terminal device rather than whichever stream happens
+    to still point at it.
     """
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        try:
+            fd = stream.fileno()
+        except (AttributeError, ValueError, OSError):
+            continue
+        if os.isatty(fd):
+            return fd
+    return None
+
+
+@contextlib.contextmanager
+def terminal_guard():
+    """Restore the terminal on the way out, however we get there.
+
+    Two layers, because a killed program skips two different kinds of cleanup:
+    termios settings (raw mode, echo) that ssh itself normally puts back, and
+    the DEC private modes the *remote* program turned on, which nothing on this
+    side knows about. Both are cheap no-ops when nothing was broken.
+    """
+    fd = terminal_fd()
+    saved = None
+    if fd is not None and termios is not None:
+        with contextlib.suppress(termios.error, OSError):
+            saved = termios.tcgetattr(fd)
+    try:
+        yield
+    finally:
+        if fd is not None:
+            for stream in (sys.stdout, sys.stderr):
+                with contextlib.suppress(ValueError, OSError):
+                    stream.flush()
+            if saved is not None:
+                with contextlib.suppress(termios.error, OSError):
+                    termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+            with contextlib.suppress(OSError):
+                os.write(fd, TERM_RESET.encode())
+
+
+def hand_over(argv: list[str], *, restore: bool = True) -> None:
+    """Give the terminal to a child and exit with its status. Never returns.
+
+    Without `restore` this is a plain execv, which is the better deal when
+    there is no terminal to leave in a bad state: no process in the middle, and
+    TTY handling, Ctrl-C and the exit code all pass through for free.
+
+    With it, we stay alive as a parent whose only job is to clean up. That
+    costs one process and buys the case this exists for — ssh dying on a broken
+    pipe, taking a remote tmux and its agent TUI with it, with nobody left to
+    turn mouse tracking back off. The child is still in our foreground process
+    group, so it keeps receiving Ctrl-C and SIGWINCH from the terminal driver
+    exactly as it did under execv.
+    """
+    if not restore:
+        os.execv(argv[0], argv)
+    else:
+        with terminal_guard():
+            proc = subprocess.Popen(argv)
+            while True:
+                try:
+                    code = proc.wait()
+                    break
+                except KeyboardInterrupt:
+                    # The child got this same Ctrl-C from the tty and decides
+                    # for itself what to do with it; outliving it is the point.
+                    continue
+        sys.exit(code)
+
+
+def exec_ssh(hc: dict, remote_cmd: str, *, tty: bool = True) -> None:
+    """Hand the terminal to ssh. Never returns."""
     ssh_bin = shutil.which("ssh")
     if not ssh_bin:
         die("'ssh' not found in PATH")
     argv = ssh_base(hc, tty=tty) + [remote_shell(remote_cmd)]
-    os.execv(ssh_bin, [ssh_bin] + argv[1:])
+    hand_over([ssh_bin] + argv[1:], restore=tty)
 
 
 def attach_session(hc: dict | None, name: str) -> None:
-    """Attach to a tmux session, locally or over ssh. Replaces this process.
+    """Attach to a tmux session, locally or over ssh. Never returns.
 
     -d detaches other clients so the pane isn't size-clamped to a stale window
     left open elsewhere; these are all the same user's sessions.
@@ -1176,7 +1269,8 @@ def attach_session(hc: dict | None, name: str) -> None:
         tmux_bin = shutil.which("tmux")
         if not tmux_bin:
             die("'tmux' not found in PATH")
-        os.execv(tmux_bin, [tmux_bin, "attach", "-d", "-t", name])
+        hand_over([tmux_bin, "attach", "-d", "-t", name])
+        return
     print(f"luv: attaching {name} on {hc['host']}")
     exec_ssh(hc, shlex.join(["tmux", "attach", "-d", "-t", name]))
 
