@@ -63,6 +63,19 @@ def run(cmd: list[str], *, cwd: str | None = None,
         return subprocess.CompletedProcess(cmd, 124, "", f"timed out after {timeout}s")
 
 
+def fan_out(fn, items: list) -> list:
+    """Map fn over items concurrently, preserving order.
+
+    A single item runs inline: every caller here fans out over hosts or GitHub
+    queries, and a thread pool for one ssh is pure overhead.
+    """
+    if len(items) <= 1:
+        return [fn(item) for item in items]
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(8, len(items))) as pool:
+        return list(pool.map(fn, items))
+
+
 def load_config() -> dict:
     """Read ~/.luv/config.json, or return {} on missing/corrupt."""
     if not CONFIG_FILE.exists():
@@ -196,7 +209,9 @@ def query_tmux(hc: dict | None) -> list[dict] | None:
     rows = []
     for line in r.stdout.strip().splitlines():
         parts = line.split("|")
-        if len(parts) != 5 or not parts[1].startswith("luv-"):
+        # A stamped @luv_workspace is proof enough on its own: a session luv
+        # started inside a tmux you opened yourself keeps the name you gave it.
+        if len(parts) != 5 or not (parts[1].startswith("luv-") or parts[2]):
             continue
         luv_id, name, workspace, attached, activity = parts
         rows.append({
@@ -207,6 +222,84 @@ def query_tmux(hc: dict | None) -> list[dict] | None:
             "activity": int(activity) if activity.isdigit() else 0,
         })
     return rows
+
+
+def workspace_number(name: str | None) -> int | None:
+    """The trailing N of a '{repo}-{N}' workspace folder, or None if it isn't one."""
+    if not name:
+        return None
+    parts = name.rsplit("-", 1)
+    if len(parts) != 2 or not parts[1].isdigit():
+        return None
+    return int(parts[1])
+
+
+def github_org_repo(url: str) -> tuple[str, str] | None:
+    """(org, repo) from a GitHub clone URL, in either syntax. None if it isn't one."""
+    m = re.match(r"https://github\.com/([^/]+)/([^/.]+)", url)
+    if not m:
+        m = re.match(r"git@github\.com:([^/]+)/([^/.]+)", url)
+    return (m.group(1), m.group(2)) if m else None
+
+
+def remote_prs_dir(hc: dict | None) -> str:
+    """The workspace root on a host, as one shell word for the remote side.
+
+    Unconfigured hosts get $HOME/prs expanded there rather than here — the
+    laptop's home directory is not the box's.
+    """
+    if hc is None:
+        return shlex.quote(str(PRS_DIR))
+    if hc.get("dir"):
+        return shlex.quote(str(hc["dir"]))
+    return '"$HOME/prs"'
+
+
+def query_origins(hc: dict | None, workspaces: list[str]) -> dict[str, tuple[str, str]]:
+    """(org, repo) per workspace folder, read from its git origin on the host.
+
+    One round trip for the whole host. A session started from another machine
+    arrives here as a folder name and nothing else, and the PR column needs an
+    owner — which guessing the configured default would get wrong for every repo
+    that isn't in it.
+    """
+    if not workspaces:
+        return {}
+    root = remote_prs_dir(hc)
+    loop = ("for w in " + " ".join(shlex.quote(w) for w in workspaces) + "; do "
+            f'echo "$w|$(git -C {root}/"$w" remote get-url origin 2>/dev/null)"; done')
+    r = ssh_run(hc, loop)
+    if r.returncode != 0:
+        return {}
+    found = {}
+    for line in r.stdout.splitlines():
+        name, _, url = line.partition("|")
+        parsed = github_org_repo(url.strip())
+        if parsed:
+            found[name] = parsed
+    return found
+
+
+def known_hosts(sessions: list[dict], host_filter: str | None = None) -> list[str]:
+    """Hosts worth scanning: the registry's, every configured one, and local.
+
+    Local stays in the set even when a remote is configured — `--local` runs and
+    pre-remote workspaces still leave folders in this machine's PRS_DIR, and an
+    empty registry must not mean "nowhere to look". Configured hosts are in it
+    because sessions on them may have been started from a different machine,
+    which leaves this registry with no entry to hang the host off.
+    """
+    hosts = {s.get("host") or "" for s in sessions} | {""}
+    remote = load_config().get("remote")
+    if isinstance(remote, dict):
+        if remote.get("host"):
+            hosts.add(remote["host"])
+        overrides = remote.get("hosts")
+        if isinstance(overrides, dict):
+            hosts |= {h for h in overrides if isinstance(h, str) and h}
+    if host_filter is not None:
+        hosts &= {host_filter}
+    return sorted(hosts)
 
 
 def live_tmux_sessions() -> set[str]:
@@ -320,32 +413,73 @@ def record_session(entry: dict) -> None:
         save_sessions(sessions)
 
 
+def adopt(host: str, row: dict, now: int) -> dict:
+    """A registry entry for a live session this machine never dispatched.
+
+    Everything tmux knows and nothing beyond it: the prompt and the agent belong
+    to whichever machine started the session, and a guess in those columns would
+    be worse than a dash. The id is the session's own @luv_id when it has one,
+    so both machines' registries agree on which session this is.
+    """
+    workspace = row["workspace"] or None
+    repo = (workspace.rsplit("-", 1)[0]
+            if workspace and workspace_number(workspace) is not None else None)
+    return {"id": row["id"] or new_session_id(), "host": host,
+            "session": row["session"], "workspace": workspace, "repo": repo,
+            "adopted": True, "last_seen": now, "attached": row["attached"],
+            "activity": row["activity"], "live": True}
+
+
+def attach_origins(pending: dict[str, list[dict]], identity: str | None) -> None:
+    """Fill in org/repo on entries that lack one, a round trip per host.
+
+    Mutates in place. The answer goes into the registry, so a session pays for
+    this once — unless the folder isn't there to ask yet, which is the one case
+    where asking again next time is exactly right.
+    """
+    work = {h: [e["workspace"] for e in entries if e.get("workspace") and not e.get("org")]
+            for h, entries in pending.items()}
+    work = {h: ws for h, ws in work.items() if ws}
+    if not work:
+        return
+    hosts = sorted(work)
+    found = dict(zip(hosts, fan_out(
+        lambda h: query_origins(resolve_host(h, identity) if h else None, work[h]),
+        hosts)))
+    for host in hosts:
+        for entry in pending[host]:
+            hit = found[host].get(entry.get("workspace"))
+            if hit:
+                entry["org"], entry["repo"] = hit
+
+
 def reconcile(sessions: list[dict],
               identity: str | None = None) -> tuple[list[dict], set[str]]:
-    """Refresh registry entries against live tmux state on each host.
+    """Refresh registry entries against live tmux state on every known host.
 
     Returns (entries, unreachable_hosts). Entries whose host did not answer are
     kept and flagged rather than pruned — running `luv ls` on a plane must not
     wipe the registry.
+
+    Live sessions no entry claims are adopted rather than ignored. The registry
+    only ever records what *this* machine dispatched, so without that a session
+    started from your laptop is invisible from your desktop, even though both
+    are looking at the same tmux server.
     """
-    hosts = sorted({s.get("host") or "" for s in sessions})
-    if not hosts:
-        return [], set()
-
-    def probe(h: str) -> list[dict] | None:
-        return query_tmux(resolve_host(h, identity) if h else None)
-
-    if len(hosts) > 1:
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=min(8, len(hosts))) as pool:
-            results = dict(zip(hosts, pool.map(probe, hosts)))
-    else:
-        results = {hosts[0]: probe(hosts[0])}
+    hosts = known_hosts(sessions)
+    results = dict(zip(hosts, fan_out(
+        lambda h: query_tmux(resolve_host(h, identity) if h else None), hosts)))
 
     now = int(time.time())
     kept: list[dict] = []
+    claimed: set[tuple[str, str]] = set()
+    # Entries whose workspace has no owner yet, per host. Adopted ones start out
+    # that way; so does an entry adopted while its session was still called
+    # luv-pending-<id>, whose folder only got a name later.
+    unowned: dict[str, list[dict]] = {}
     for s in sessions:
-        live = results.get(s.get("host") or "")
+        host = s.get("host") or ""
+        live = results.get(host)
         if live is None:  # host unreachable — keep last known state
             s["live"] = None
             kept.append(s)
@@ -361,7 +495,22 @@ def reconcile(sessions: list[dict],
         s["activity"] = match["activity"]
         s["last_seen"] = now
         s["live"] = True
+        claimed.add((host, match["session"]))
+        if s.get("workspace") and not s.get("org"):
+            unowned.setdefault(host, []).append(s)
         kept.append(s)
+
+    for host in hosts:
+        for row in results.get(host) or []:
+            if (host, row["session"]) in claimed:
+                continue
+            claimed.add((host, row["session"]))
+            entry = adopt(host, row, now)
+            if entry["workspace"]:
+                unowned.setdefault(host, []).append(entry)
+            kept.append(entry)
+    attach_origins(unowned, identity)
+
     return kept, {h for h, v in results.items() if v is None}
 
 
@@ -370,23 +519,7 @@ def parse_github_remote(cwd: str) -> tuple[str, str] | None:
     r = run(["git", "remote", "get-url", "origin"], cwd=cwd)
     if r.returncode != 0:
         return None
-    url = r.stdout.strip()
-    m = re.match(r"https://github\.com/([^/]+)/([^/.]+)", url)
-    if not m:
-        m = re.match(r"git@github\.com:([^/]+)/([^/.]+)", url)
-    if m:
-        return m.group(1), m.group(2)
-    return None
-
-
-def workspace_number(name: str | None) -> int | None:
-    """The trailing N of a '{repo}-{N}' workspace folder, or None if it isn't one."""
-    if not name:
-        return None
-    parts = name.rsplit("-", 1)
-    if len(parts) != 2 or not parts[1].isdigit():
-        return None
-    return int(parts[1])
+    return github_org_repo(r.stdout.strip())
 
 
 def resolve_org(explicit: str | None = None) -> str:
@@ -1413,17 +1546,7 @@ def attach_pr_links(rows: list[dict]) -> bool:
               file=sys.stderr)
         return changed
 
-    def probe(item: tuple) -> dict | None:
-        _, org, repo, number = item
-        return fetch_pr(org, repo, number)
-
-    if len(stale) > 1:
-        from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=min(8, len(stale))) as pool:
-            found = list(pool.map(probe, stale))
-    else:
-        found = [probe(stale[0])]
-
+    found = fan_out(lambda item: fetch_pr(*item[1:]), stale)
     for (s, *_), pr in zip(stale, found):
         s["pr_number"] = pr["number"] if pr else None
         s["pr_url"] = pr["url"] if pr else None
@@ -1448,10 +1571,16 @@ def hyperlink(url: str | None, label: str) -> str:
 def refresh_sessions(identity: str | None = None) -> tuple[list[dict], set[str]]:
     """Reconcile and persist the registry, warning about unreachable hosts."""
     with session_lock():
-        sessions, unreachable = reconcile(load_sessions(), identity)
+        stored = load_sessions()
+        known = {s.get("host") or "" for s in stored}
+        sessions, unreachable = reconcile(stored, identity)
         save_sessions(sessions)
     for host in sorted(unreachable):
-        print(f"luv: warning: {host or 'local'} unreachable — showing last known state",
+        # A host with entries has a last known state to fall back on; one we
+        # only scanned because it is configured has nothing to show at all.
+        detail = ("showing last known state" if host in known
+                  else "its sessions are not listed")
+        print(f"luv: warning: {host or 'local'} unreachable — {detail}",
               file=sys.stderr)
     return sessions, unreachable
 
@@ -1539,19 +1668,6 @@ def cmd_ls(args: list[str], identity: str | None = None) -> None:
     print_sessions(rows)
 
 
-def remote_prs_dir(hc: dict | None) -> str:
-    """The workspace root on a host, as one shell word for the remote side.
-
-    Unconfigured hosts get $HOME/prs expanded there rather than here — the
-    laptop's home directory is not the box's.
-    """
-    if hc is None:
-        return shlex.quote(str(PRS_DIR))
-    if hc.get("dir"):
-        return shlex.quote(str(hc["dir"]))
-    return '"$HOME/prs"'
-
-
 def rm_workspace(hc: dict | None, session: str | None, workspace: str) -> str | None:
     """Kill the tmux session and delete its folder on `hc`. Returns an error.
 
@@ -1599,22 +1715,6 @@ def orphan_workspaces(hc: dict | None) -> list[str] | None:
     return [f for f in folders
             if workspace_number(f) is not None
             and f not in running and tmux_session_name(f) not in running]
-
-
-def known_hosts(sessions: list[dict], host_filter: str | None) -> list[str]:
-    """Hosts worth scanning: the registry's, the default one, and always local.
-
-    Local stays in the set even when a remote is configured — `--local` runs and
-    pre-remote workspaces still leave folders in this machine's PRS_DIR, and an
-    empty registry must not mean "nowhere to look".
-    """
-    hosts = {s.get("host") or "" for s in sessions} | {""}
-    remote = load_config().get("remote")
-    if isinstance(remote, dict) and remote.get("host"):
-        hosts.add(remote["host"])
-    if host_filter is not None:
-        hosts &= {host_filter}
-    return sorted(hosts)
 
 
 def cmd_rm(args: list[str], identity: str | None = None, force: bool = False) -> None:
@@ -1846,7 +1946,7 @@ Commands:
   luv config set|get|unset <key> [value]  read or write a single setting
   luv config list                         show all settings
   luv --init                              configure default GitHub org only
-  luv ls [--host H] [--prune] [--no-pr]   list live sessions across hosts
+  luv ls [--host H] [--prune] [--no-pr]   list every live session on every host
   luv continue [<repo> [number]]          attach to a live session
   luv rm <session|workspace>...           kill a session and delete its folder
   luv rm --merged [--host H] [-f]         remove every session whose PR is merged
@@ -1866,7 +1966,8 @@ Org resolution:
 
 Remote:
   Once 'luv config' has a remote host, every workspace command runs there inside
-  a tmux session that survives disconnects. 'luv ls' shows what is running and
+  a tmux session that survives disconnects. 'luv ls' shows what is running on
+  every host — including sessions started from another machine — and
   'luv continue' reattaches. Use --local for a one-off local run.
   Requires luv, tmux, gh and git on the remote. See docs/remote-sessions.md.
 

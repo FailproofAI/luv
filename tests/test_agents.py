@@ -375,15 +375,34 @@ class RegistryTests(unittest.TestCase):
             p.stop()
         self.tempdir.cleanup()
 
+    @staticmethod
+    def _hosts(tmux, origins=None):
+        """Stub ssh_run so every host answers for itself.
+
+        Values are that host's `tmux list-sessions` output, or None for a host
+        that never answers. Hosts absent from the mapping — the scan always
+        covers local plus everything in the config — report nothing running.
+        """
+        def fake(hc, cmd, **kwargs):
+            host = hc["host"] if hc else ""
+            if not cmd.startswith("tmux list-sessions"):
+                return _completed((origins or {}).get(host, ""))
+            answer = tmux.get(host, "")
+            if answer is None:
+                return _completed("", 255, "ssh: connect: timed out")
+            return _completed(answer)
+        return patch.object(luv, "ssh_run", side_effect=fake)
+
     def test_renamed_session_is_matched_by_luv_id(self):
         entry = {"id": "abc123", "host": "box", "session": "luv-pending-abc123",
                  "workspace": None, "repo": "myrepo"}
         line = "abc123|luv-myrepo-42|myrepo-42|1|1700000000\n"
 
-        with patch.object(luv, "ssh_run", return_value=_completed(line)):
+        with self._hosts({"box": line}):
             kept, unreachable = luv.reconcile([entry])
 
         self.assertEqual(unreachable, set())
+        self.assertEqual(len(kept), 1, "the live session must not also be adopted")
         self.assertEqual(kept[0]["session"], "luv-myrepo-42")
         self.assertEqual(kept[0]["workspace"], "myrepo-42")
         self.assertTrue(kept[0]["attached"])
@@ -392,7 +411,7 @@ class RegistryTests(unittest.TestCase):
     def test_dead_session_is_pruned_when_host_answers(self):
         entry = {"id": "abc123", "host": "box", "session": "luv-myrepo-42"}
 
-        with patch.object(luv, "ssh_run", return_value=_completed("")):
+        with self._hosts({"box": ""}):
             kept, unreachable = luv.reconcile([entry])
 
         self.assertEqual(kept, [])
@@ -401,8 +420,7 @@ class RegistryTests(unittest.TestCase):
     def test_unreachable_host_keeps_its_entries(self):
         entry = {"id": "abc123", "host": "box", "session": "luv-myrepo-42"}
 
-        with patch.object(luv, "ssh_run",
-                          return_value=_completed("", 255, "ssh: connect: timed out")):
+        with self._hosts({"box": None}):
             kept, unreachable = luv.reconcile([entry])
 
         self.assertEqual(len(kept), 1, "an offline host must not wipe the registry")
@@ -415,7 +433,7 @@ class RegistryTests(unittest.TestCase):
         entry = {"id": "abc123", "host": "box", "session": "luv-myrepo-42"}
         line = "|luv-myrepo-42|myrepo-42|0|1700000000\n"
 
-        with patch.object(luv, "ssh_run", return_value=_completed(line)):
+        with self._hosts({"box": line}):
             kept, _ = luv.reconcile([entry])
 
         self.assertEqual(len(kept), 1)
@@ -425,10 +443,73 @@ class RegistryTests(unittest.TestCase):
         entry = {"id": "abc123", "host": "box", "session": "luv-myrepo-42"}
         line = "|someones-other-session||0|1700000000\n"
 
-        with patch.object(luv, "ssh_run", return_value=_completed(line)):
+        with self._hosts({"box": line}):
             kept, _ = luv.reconcile([entry])
 
         self.assertEqual(kept, [])
+
+    def test_a_session_started_elsewhere_is_adopted(self):
+        line = "zz99|luv-myrepo-42|myrepo-42|0|1700000000\n"
+        origin = "myrepo-42|git@github.com:acme/myrepo.git\n"
+
+        with self._hosts({"box": line}, origins={"box": origin}):
+            kept, _ = luv.reconcile([])
+
+        self.assertEqual(len(kept), 1, "an empty registry must not mean empty output")
+        self.assertEqual(kept[0], {
+            "id": "zz99", "host": "box", "session": "luv-myrepo-42",
+            "workspace": "myrepo-42", "org": "acme", "repo": "myrepo",
+            "adopted": True, "last_seen": kept[0]["last_seen"],
+            "attached": False, "activity": 1700000000, "live": True,
+        })
+
+    def test_a_configured_host_is_scanned_without_any_entry_for_it(self):
+        # 'gpu' only exists under remote.hosts — nothing on this machine has
+        # ever dispatched to it, so the registry offers no reason to look.
+        line = "|luv-myrepo-7|myrepo-7|1|1700000000\n"
+
+        with self._hosts({"gpu": line}):
+            kept, _ = luv.reconcile([])
+
+        self.assertEqual([(s["host"], s["session"]) for s in kept],
+                         [("gpu", "luv-myrepo-7")])
+        self.assertEqual(kept[0]["repo"], "myrepo", "derived from the folder name")
+        self.assertTrue(kept[0]["id"], "an unstamped session still needs an id")
+
+    def test_an_adopted_session_is_matched_not_adopted_twice(self):
+        line = "zz99|luv-myrepo-42|myrepo-42|0|1700000000\n"
+
+        with self._hosts({"box": line}):
+            first, _ = luv.reconcile([])
+            luv.save_sessions(first)
+            again, _ = luv.reconcile(luv.load_sessions())
+
+        self.assertEqual(len(again), 1)
+        self.assertEqual(again[0]["id"], "zz99")
+
+    def test_an_owner_is_backfilled_once_the_workspace_has_a_name(self):
+        # Adopted mid-dispatch, while the session was still luv-pending-zz99 and
+        # the clone had no folder to read an origin from.
+        entry = {"id": "zz99", "host": "box", "session": "luv-pending-zz99",
+                 "workspace": None, "adopted": True}
+        line = "zz99|luv-myrepo-42|myrepo-42|0|1700000000\n"
+        origin = "myrepo-42|https://github.com/acme/myrepo\n"
+
+        with self._hosts({"box": line}, origins={"box": origin}):
+            kept, _ = luv.reconcile([entry])
+
+        self.assertEqual(len(kept), 1)
+        self.assertEqual((kept[0]["org"], kept[0]["repo"]), ("acme", "myrepo"))
+
+    def test_a_local_session_is_listed_too(self):
+        line = "|my-own-tmux|myrepo-3|1|1700000000\n"
+
+        with self._hosts({"": line}):
+            kept, unreachable = luv.reconcile([])
+
+        self.assertEqual(kept[0]["host"], "")
+        self.assertEqual(kept[0]["workspace"], "myrepo-3")
+        self.assertEqual(unreachable, set(), "local is never unreachable")
 
     def test_transient_fields_are_not_persisted(self):
         luv.save_sessions([{"id": "a", "live": True, "attached": True, "activity": 9}])

@@ -1,18 +1,19 @@
 # The session registry
 
-`luv ls` needs to answer "what am I running, and where?" — including for hosts
+`luv ls` needs to answer "what is running, and where?" — including for hosts
 that are currently offline. It does that from `~/.luv/sessions.json`, a local
 cache of every session luv has started, reconciled against live tmux state on
 each run.
 
 ## Why it exists
 
-The obvious approach — just ask each host `tmux ls` — has two gaps:
+The registry is not the source of truth for *what is running* — the hosts are.
+It exists for the two things asking `tmux ls` cannot tell you:
 
-1. **luv wouldn't know which hosts to ask.** Once you use `-s` for a second
-   machine, the config's default host is no longer the whole picture.
-2. **tmux doesn't remember why a session exists.** The prompt you started with,
-   the org, and the agent aren't tmux's business.
+1. **Which hosts to ask.** Once you use `-s` for a second machine, the config's
+   default host is no longer the whole picture.
+2. **Why a session exists.** The prompt you started with, the org, and the agent
+   aren't tmux's business.
 
 There's also a sequencing problem. Your laptop can't know the workspace number
 in advance — it comes from `gh api` running *on the remote* — so at dispatch
@@ -61,18 +62,25 @@ the session (which luv does as soon as the clone lands) breaks nothing.
 | `pr_state` | `OPEN`, `CLOSED` or `MERGED` — what `luv rm --merged` selects on |
 | `pr_checked` | Unix time GitHub was last asked about it |
 | `pr_hint` | PR number known at dispatch (`-l` / `-pr` only); absent otherwise |
+| `adopted` | Present when this machine found the session rather than starting it |
 
 `attached`, `activity`, and `live` are recomputed on every reconcile and are
 deliberately **not** written back to the file.
 
 ## Reconciliation
 
-On `luv ls` and `luv continue`, luv groups entries by host and runs one query
-per host (concurrently when there's more than one):
+`luv ls`, `luv continue` and `luv rm` scan every host luv knows about — every
+one with a registry entry, every one in the config (`remote.host` and each
+`remote.hosts.<name>`), and always the local machine. One query per host, run
+concurrently:
 
 ```
 tmux list-sessions -F '#{@luv_id}|#{session_name}|#{@luv_workspace}|#{session_attached}|#{session_activity}'
 ```
+
+A session counts as luv's if it is named `luv-*` or carries a `@luv_workspace`
+option — the second covers a local run inside a tmux you opened and named
+yourself, which luv never renames.
 
 Each entry then lands in one of three states:
 
@@ -84,6 +92,32 @@ Each entry then lands in one of three states:
 
 Matching prefers `@luv_id` and falls back to the session name, which covers
 sessions created before the option was stamped.
+
+## Sessions started somewhere else
+
+A registry only ever records what *that* machine dispatched. Left there, a
+session started from your laptop would be invisible from your desktop even
+though both are looking at the same tmux server — and the laptop is exactly the
+machine you don't have with you.
+
+So a live session that no entry claims is **adopted**: written into the registry
+as a new entry, flagged `adopted`, and listed like any other. From that point it
+is a normal entry — `luv continue` attaches to it, `luv rm` tears it down, and
+the next reconcile matches it on its `@luv_id` rather than adopting it twice.
+
+An adopted entry carries only what tmux knows: host, session, workspace,
+attached, activity. The prompt and the agent belonged to the machine that
+started the session, so those columns show `-` rather than a guess. The one
+thing luv does reach for is the org, because the PR column is useless without
+it — one round trip per host reads `git remote get-url origin` in each adopted
+workspace, and the answer is cached in the registry like everything else:
+
+```
+for w in myrepo-42 myrepo-51; do echo "$w|$(git -C ~/prs/"$w" remote get-url origin)"; done
+```
+
+The configured default org would be the cheaper guess and the wrong one for
+every repo that isn't in it — a wrong PR link is worse than none.
 
 **An unreachable host never causes pruning.** This is the rule the whole design
 protects: running `luv ls` on a plane, or while a box is rebooting, must not
@@ -205,8 +239,10 @@ The registry is a cache. Deleting it is safe:
 rm ~/.luv/sessions.json
 ```
 
-You lose the metadata luv can't recover — the prompt text, and which hosts to
-look at — but no sessions. They're still running; find them with
-`ssh <host> tmux ls` and reattach with `tmux attach -t <name>`.
+You lose the metadata luv can't recover — the prompt text, and any host that is
+neither configured nor the local machine — but no sessions. Everything running
+on a host luv still knows about is adopted back on the next `luv ls`. For a host
+that fell out of the set entirely, `ssh <host> tmux ls` and
+`tmux attach -t <name>` still work, or add it back with `-s <host>`.
 
 A corrupt or unparseable file is treated as empty rather than crashing.
