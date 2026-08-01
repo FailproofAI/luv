@@ -30,11 +30,12 @@ the session (which luv does as soon as the clone lands) breaks nothing.
     {
       "id": "k3f9a2c1",
       "host": "box",
-      "session": "luv-myrepo-42",
+      "session": "luv-myrepo-box-42",
       "org": "exosphere",
       "repo": "myrepo",
-      "workspace": "myrepo-42",
+      "workspace": "myrepo-box-42",
       "agent": "claude",
+      "model": null,
       "prompt": "fix the flaky test",
       "created": 1753401234,
       "last_seen": 1753408899,
@@ -53,8 +54,9 @@ the session (which luv does as soon as the clone lands) breaks nothing.
 | `host` | The `remote.host` value used, or absent for a local session |
 | `session` | tmux session name; starts as `luv-pending-<id>` and is corrected on the first reconcile |
 | `org`, `repo` | GitHub owner and repo, resolved on the laptop |
-| `workspace` | Folder name (`myrepo-42`); `null` until the remote reports it |
+| `workspace` | Folder name (`myrepo-box-42`); `null` until the remote reports it. The middle part names the machine that created it — see [configuration.md](configuration.md#machine) |
 | `agent` | `claude` or `codex` |
+| `model` | The `-m` value, or `null` for the agent's default; replayed by `luv handover` |
 | `prompt` | The prompt you launched with, for the `luv ls` label |
 | `created` | Unix time the entry was written |
 | `last_seen` | Unix time of the last successful reconcile |
@@ -69,10 +71,10 @@ deliberately **not** written back to the file.
 
 ## Reconciliation
 
-`luv ls`, `luv continue` and `luv rm` scan every host luv knows about — every
-one with a registry entry, every one in the config (`remote.host` and each
-`remote.hosts.<name>`), and always the local machine. One query per host, run
-concurrently:
+`luv ls`, `luv continue`, `luv rm` and `luv handover` scan every host luv knows
+about — every one with a registry entry, every one in the config (`remote.host`
+and each `remote.hosts.<name>`), and always the local machine. One query per
+host, run concurrently:
 
 ```
 tmux list-sessions -F '#{@luv_id}|#{session_name}|#{@luv_workspace}|#{session_attached}|#{session_activity}'
@@ -107,17 +109,19 @@ the next reconcile matches it on its `@luv_id` rather than adopting it twice.
 
 An adopted entry carries only what tmux knows: host, session, workspace,
 attached, activity. The prompt and the agent belonged to the machine that
-started the session, so those columns show `-` rather than a guess. The one
-thing luv does reach for is the org, because the PR column is useless without
-it — one round trip per host reads `git remote get-url origin` in each adopted
-workspace, and the answer is cached in the registry like everything else:
+started the session, so those columns show `-` rather than a guess. The org and
+repo are the exception, because the PR column is useless without them — one
+round trip per host reads `git remote get-url origin` in each adopted workspace,
+and the answer is cached in the registry like everything else:
 
 ```
-for w in myrepo-42 myrepo-51; do echo "$w|$(git -C ~/prs/"$w" remote get-url origin)"; done
+for w in myrepo-box-42 myrepo-box-51; do echo "$w|$(git -C ~/prs/"$w" remote get-url origin)"; done
 ```
 
-The configured default org would be the cheaper guess and the wrong one for
-every repo that isn't in it — a wrong PR link is worse than none.
+Reading them off the folder name instead is not an option: `myrepo-box-42`
+cannot be split into repo and slug without already knowing one of the two, and
+the configured default org would be the wrong answer for every repo that isn't
+in it — a wrong PR link is worse than none.
 
 **An unreachable host never causes pruning.** This is the rule the whole design
 protects: running `luv ls` on a plane, or while a box is rebooting, must not
@@ -135,26 +139,44 @@ luv ls --prune
 That drops entries for hosts that didn't answer, in addition to the dead ones
 reconciliation already removed.
 
+## Handover
+
+`luv handover` replaces the moved session's entry rather than editing it: the
+old one is dropped and the destination writes a fresh entry, with a new `id` and
+`@luv_id`, carrying the original `org`, `repo`, `agent`, `model`, and `prompt`.
+The `workspace` name is unchanged, slug and all.
+
+Note that the registry only ever learns about sessions luv **dispatched to a
+host** — a `luv --local` run records nothing. So a workspace on the machine
+you're sitting at is normally absent from it, which is why handover falls back
+to looking on disk instead of treating a miss as an error.
+
 ## PR links
 
-Every luv workspace is one pull request by construction — folder `{repo}-{N}`,
-branch `luv-{N}` — so `luv ls` can show the PR each session is producing:
+Every luv workspace is one pull request by construction — folder
+`{repo}-{machine}-{N}`, branch `luv-{machine}-{N}` — so `luv ls` can show the PR
+each session is producing:
 
 ```
-HOST  SESSION         WORKSPACE   AGENT   ATTACHED  ACTIVE  PR    PROMPT
-box   luv-myrepo-42   myrepo-42   claude  yes       2m ago  #42   fix the flaky test
-box   luv-myrepo-51   myrepo-51   codex   no        1h ago  -     add rate limiting
+HOST  SESSION             WORKSPACE       AGENT   ATTACHED  ACTIVE  PR    PROMPT
+box   luv-myrepo-box-42   myrepo-box-42   claude  yes       2m ago  #42   fix the flaky test
+box   luv-myrepo-box-51   myrepo-box-51   codex   no        1h ago  -     add rate limiting
 ```
 
 `#42` is an OSC 8 terminal hyperlink, so ctrl/cmd-click opens the PR. When
 stdout isn't a terminal there's nothing to click and a bare number would be
 useless, so `luv ls | grep` and redirects get the full URL instead.
 
-The lookup asks GitHub for the PR whose head branch is `luv-{N}`:
+The lookup asks GitHub for the PR whose head branch is the workspace's own:
 
 ```
-gh pr list --repo {org}/{repo} --head luv-{N} --state all --limit 1 --json number,url
+gh pr list --repo {org}/{repo} --head luv-{machine}-{N} --state all --limit 1 --json number,url
 ```
+
+The branch is read back off the folder name rather than rebuilt from this
+machine's slug — the folder keeps the slug of whichever machine created it, both
+after a handover and for a session another machine started. A pre-slug folder
+implies a pre-slug `luv-{N}` branch, which is what it gets asked for.
 
 `gh pr list` rather than the REST endpoint because its `--head` takes a bare
 branch name. REST wants `head={owner}:{branch}`, and the owner luv recorded is
@@ -172,7 +194,7 @@ branch is the PR's own head ref, which the head query would never match.
 Results are cached in the registry so repeat runs are instant and a link stays
 on screen when GitHub is unreachable — 5 minutes for a PR that was found, 1
 minute when there wasn't one yet (the agent may open it any moment). A session
-with no PR, no org, or a folder that isn't `{repo}-{N}` shows `-`.
+with no PR, no org, or a folder that isn't a workspace of its repo shows `-`.
 
 `luv ls --no-pr` skips the whole thing for a fast, offline-safe listing, which
 is also what happens automatically when `gh` isn't installed. `luv continue`
@@ -185,7 +207,7 @@ deletes the workspace folder on whichever host the session lives on, then drops
 the registry entry.
 
 ```bash
-luv rm myrepo-42          # by workspace, or by session name
+luv rm myrepo-box-42      # by workspace, or by session name
 luv rm --merged           # every session whose PR state is MERGED
 luv rm --dead             # workspaces on a host with no live luv session
 luv rm --dead --host box  # scope either selector to one machine
@@ -208,10 +230,10 @@ case.
 
 Two things bound the damage:
 
-- Only names matching `{repo}-{N}` are eligible, checked again immediately
-  before the `rm -rf` rather than only at selection time. A stray directory in
-  the workspace root is never a candidate, and a target that resolves to one is
-  an error, not a deletion.
+- Only names ending in `-{N}` are eligible — `{repo}-{machine}-{N}` and pre-slug
+  `{repo}-{N}` alike — checked again immediately before the `rm -rf` rather than
+  only at selection time. A stray directory in the workspace root is never a
+  candidate, and a target that resolves to one is an error, not a deletion.
 - A named target is its own confirmation, but `--merged` and `--dead` print what
   they matched and ask, because a selector can sweep up folders on a machine you
   are not looking at. `-f` skips the prompt.

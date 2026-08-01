@@ -53,7 +53,7 @@ luv -r my-repo 42
 luv --clean
 
 # Tear down a finished session: kill its tmux, delete its workspace
-luv rm myrepo-42
+luv rm myrepo-mbp-42
 luv rm --merged        # everything whose PR has landed
 
 # See what's running on your remote machine, and reattach
@@ -63,12 +63,14 @@ luv continue
 
 ## How it works
 
-1. Clones the repo into `~/prs/{repo}-{number}/`
-2. Creates a new branch `luv-{number}`
+1. Clones the repo into `~/prs/{repo}-{machine}-{number}/`
+2. Creates a new branch `luv-{machine}-{number}`
 3. Configures the selected agent with the workspace's PR conventions
 4. Launches Claude with Opus 5 at max effort, or Codex in YOLO mode
 
-All workspaces live under `~/prs/`. The number comes from the repo's GitHub issue counter to avoid collisions.
+All workspaces live under `~/prs/`. The number comes from the repo's GitHub issue counter, and `{machine}` is a short name for the machine that created the workspace — by default the hostname, or whatever you set with `luv config set machine mbp`.
+
+The machine name is what keeps two computers apart. Each one works out the next number from GitHub independently, so your laptop and your box will happily pick the same one; without the slug they would both push a branch called `luv-43`. Folders and branches created before this keep working unchanged.
 
 With a remote host configured, steps 1–4 happen on that machine inside a tmux session instead — see [Remote sessions](#remote-sessions).
 
@@ -82,6 +84,7 @@ With a remote host configured, steps 1–4 happen on that machine inside a tmux 
 | `luv --init` | Configure default GitHub org only |
 | `luv ls [--host H] [--prune] [--no-pr]` | List every live session on every host, with each one's PR link |
 | `luv continue [<repo> [number]]` | Attach to a live session |
+| `luv handover [<repo> [n]] --to HOST` | Move a session to another machine and resume it there |
 | `luv rm <session\|workspace>...` | Kill a session and delete its workspace on its host |
 | `luv rm --merged [--host H] [-f]` | Remove every session whose PR is merged |
 | `luv rm --dead [--host H] [-f]` | Remove workspaces with no live session |
@@ -111,8 +114,19 @@ With a remote host configured, steps 1–4 happen on that machine inside a tmux 
 | `-s HOST` | Run on `HOST` over SSH, overriding the configured remote host |
 | `-i PATH` | SSH identity file to use for this invocation |
 | `--local` | Force local execution even when a remote host is configured |
-| `-f`, `--force` | Skip safety checks (with `--clean`) |
+| `-f`, `--force` | Skip safety checks (with `--clean`); replace an existing destination folder (with `handover`) |
 | `--safe` | With `--clean -f`, only delete workspaces older than 24h (mtime) |
+
+Handover flags:
+
+| Flag | Description |
+|------|-------------|
+| `--to HOST` | Destination machine; `local` for the one you're on |
+| `--from HOST` | Source machine, when luv can't tell from its session registry |
+| `--no-agent-state` | Move the workspace only; the agent starts a new conversation |
+| `--no-attach` | Leave the destination session running detached |
+| `--purge` | Delete the source folder once the copy is verified |
+| `-y` | Skip the "an agent may still be running" confirmation |
 
 ## Docker dev environments
 
@@ -156,7 +170,7 @@ The `dev-environment` service **must** have the selected agent CLI (`claude` or 
 
 1. Detects `.luv/settings.json` with `compose_file` key
 2. Tears down any stale environment from a previous run
-3. Starts `docker compose up -d --build` with a unique project name (`luv-{repo}-{number}`) for network/volume isolation
+3. Starts `docker compose up -d --build` with a unique project name (`luv-{repo}-{machine}-{number}`) for network/volume isolation
 4. Verifies the `dev-environment` service is running
 5. Runs the selected agent inside the container via `docker compose exec`
 6. The repo is volume-mounted, so all file changes and git commits are visible on the host
@@ -182,6 +196,20 @@ luv continue                        # reattach exactly where you left off
 
 Use `--local` for a one-off local run, `-s HOST` to target a different machine, and `-i PATH` for a different SSH key.
 
+### Handing a session to another machine
+
+Start something on your laptop, then move it — workspace, uncommitted work, and the agent's conversation — to a machine that won't go to sleep:
+
+```bash
+luv --local myrepo "start something"   # working locally
+luv handover myrepo 43 --to box        # resumes mid-conversation on box
+luv handover myrepo 43 --to local      # ...and back again later
+```
+
+The whole folder crosses over, including untracked and gitignored files, so a workspace that ran before the move still runs after it. The agent's transcript moves too, so it picks up where it left off rather than starting fresh. Bytes are relayed through the machine you run the command on, so the two ends never need SSH access to each other.
+
+The source folder is left on disk (`--purge` deletes it), and the workspace keeps the name it was created with.
+
 Full guide, including how to prepare a fresh Ubuntu box and set up SSH keys: **[docs/remote-sessions.md](docs/remote-sessions.md)**.
 
 ## Workspace cleanup
@@ -203,8 +231,8 @@ delete, and never touches a workspace with a live session. `luv rm` is the
 opposite — you name what goes, and it goes, on whichever host it lives on.
 
 ```bash
-luv rm myrepo-42          # kill its tmux session, delete ~/prs/myrepo-42 on its host
-luv rm luv-myrepo-42      # the session name works too
+luv rm myrepo-mbp-42      # kill its tmux session, delete the folder on its host
+luv rm luv-myrepo-mbp-42  # the session name works too
 luv rm --merged           # every session whose PR has been merged
 luv rm --dead             # workspaces left behind by sessions that already exited
 luv rm --dead --host box  # scope either selector to one machine
@@ -219,9 +247,9 @@ registry as soon as its tmux session exits, but the clone it was working in
 stays on the remote disk. Those orphans are invisible to `luv ls` and are
 usually what is actually filling up the box.
 
-Only folders named `{repo}-{N}` are ever eligible — anything else in the
-workspace root is left alone, and a target that doesn't resolve to one is an
-error rather than an `rm -rf`.
+Only folders ending in `-{N}` are ever eligible — `{repo}-{machine}-{N}` and
+pre-slug `{repo}-{N}` alike. Anything else in the workspace root is left alone,
+and a target that doesn't resolve to one is an error rather than an `rm -rf`.
 
 ## Configuration
 

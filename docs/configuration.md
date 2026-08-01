@@ -43,6 +43,28 @@ want for hosts, paths, and org names.
 The **laptop** resolves this before dispatching, so a remote machine never needs
 its own `org` configured.
 
+### `machine`
+
+*string, default: this machine's hostname.* A short name for **this** machine,
+used in the workspace folder (`myrepo-mbp-43`) and branch (`luv-mbp-43`) of
+everything created here.
+
+It exists because every machine works out the next workspace number from
+GitHub's issue counter independently, so a laptop and a box will happily pick
+the same one — and without the slug they would push the same branch. The value
+is lowercased, stripped to letters and digits, and capped at 8 characters, so
+`Niveds-MacBook.local` becomes `nivedsma`; set it explicitly for something
+readable:
+
+```bash
+luv config set machine mbp
+```
+
+The slug is stamped when a workspace is created and never changes afterwards —
+`luv handover` moves `myrepo-mbp-43` to another machine under that same name,
+because it records where the workspace came from and its branch may already be
+pushed. Workspaces created before slugs existed keep working.
+
 ### `prs_dir`
 
 *string, default `~/prs`.* Where workspace folders are created on **this**
@@ -107,6 +129,7 @@ those combinations contradict each other.
 ```json
 {
   "org": "exosphere",
+  "machine": "mbp",
   "prs_dir": "~/prs",
   "remote": {
     "host": "box",

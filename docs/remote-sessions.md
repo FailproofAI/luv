@@ -9,6 +9,7 @@ still up.
 - [Preparing a new remote machine (Ubuntu)](#preparing-a-new-remote-machine-ubuntu)
 - [Configuring luv](#configuring-luv)
 - [Daily use](#daily-use)
+- [Handing a session to another machine](#handing-a-session-to-another-machine)
 - [Session lifecycle](#session-lifecycle)
 - [Session naming and identity](#session-naming-and-identity)
 - [What runs where](#what-runs-where)
@@ -28,9 +29,9 @@ luv myrepo "fix the bug"
   └─ ssh -t box 'bash -lc "…"'  ────►  tmux new-session -A -s luv-pending-3f9a
                                          └─ luv exosphere/myrepo "fix the bug"
                                               ├─ gh api        → next number = 42
-                                              ├─ git clone     → ~/prs/myrepo-42
-                                              ├─ git checkout -b luv-42
-                                              ├─ tmux rename-session → luv-myrepo-42
+                                              ├─ git clone     → ~/prs/myrepo-box-42
+                                              ├─ git checkout -b luv-box-42
+                                              ├─ tmux rename-session → luv-myrepo-box-42
                                               └─ exec claude …
                                        (session keeps running after you disconnect)
 ```
@@ -210,18 +211,23 @@ On your laptop:
 luv config
 ```
 
-The wizard asks for the host, the SSH identity file, and the remote workspace
-directory, then offers to set your default GitHub org. It finishes by checking
-the remote for `tmux`, `luv`, `gh`, and `git` and telling you exactly what's
-missing.
+The wizard asks for this machine's name, the host, the SSH identity file, and
+the remote workspace directory, then offers to set your default GitHub org. It
+finishes by checking the remote for `tmux`, `luv`, `gh`, and `git` and telling
+you exactly what's missing.
 
 Non-interactively:
 
 ```bash
+luv config set machine mbp
 luv config set remote.host box
 luv config set remote.identity_file ~/.ssh/id_ed25519
 luv config list
 ```
+
+Setting `machine` on each machine you use is worth the ten seconds: it is the
+label that ends up in every workspace folder and branch name, and the hostname
+default is rarely the nicest one.
 
 Full key reference: [configuration.md](configuration.md).
 
@@ -250,6 +256,75 @@ luv -i ~/.ssh/other_key myrepo      # use a different key this once
 Detach from a session with `Ctrl-b d` (tmux's default prefix). The agent keeps
 running.
 
+## Handing a session to another machine
+
+`luv handover` relocates a running workspace. The usual direction is laptop →
+box: you start something locally, then decide it should keep running somewhere
+that doesn't sleep.
+
+```bash
+luv --local myrepo "start something"   # → ~/prs/myrepo-mbp-43, branch luv-mbp-43
+luv handover myrepo 43 --to box        # attaches to it, now running on box
+luv handover myrepo 43 --to local      # and back down again later
+```
+
+```
+                LAPTOP (the one you run the command on)
+                  │
+  ssh box tar -c ─┤─ ssh gpu tar -x        ← bytes are relayed through here, so
+                  │                          box and gpu need no keys for each other
+   BOX                                    GPU-BOX
+   tmux kill-session luv-myrepo-mbp-43
+   docker compose -p … down
+   ~/prs/myrepo-mbp-43   ───────────────► ~/prs/myrepo-mbp-43     (whole folder)
+   ~/.claude/projects/-home-u-prs-…  ───► ~/.claude/projects/…    (transcript)
+   (folder left in place)                 tmux new-session -A -s luv-myrepo-mbp-43
+                                            └─ luv exo/myrepo 43 -r → claude --resume
+```
+
+**Everything crosses over.** The folder is copied byte for byte — `.git`, staged
+and unstaged edits, untracked files, and gitignored ones like `.env` and
+`node_modules`. A workspace that ran before the move still runs after it.
+
+**So does the conversation.** Claude's transcript
+(`~/.claude/projects/<path-slug>/*.jsonl`) and Codex's rollouts
+(`~/.codex/sessions/**/rollout-*.jsonl`) travel with the workspace, and the
+absolute path recorded inside them is rewritten for the new machine — the two
+rarely agree on it. The destination then starts with `-r`, so `claude --resume`
+or `codex resume --last` continues the thread rather than opening a new one.
+This part depends on each agent's on-disk layout, so luv says what it found and
+carries on with a fresh conversation if it finds nothing; `--no-agent-state`
+skips it deliberately.
+
+**The agent is briefly down.** luv checks everything it can first — the
+destination is reachable, has luv, and has no folder in the way — then stops the
+agent, because copying a workspace out from under a running one is the only way
+to get a torn tree. Killing the tmux session SIGHUPs the pane, so luv also tears
+the Docker environment down explicitly rather than relying on the agent's exit.
+
+**Nothing is deleted.** The source folder stays on disk, so a failed transfer
+costs nothing: luv prints the command to restart the session where it was. Use
+`--purge` to delete it once the copy verifies, or `luv --clean` on that machine
+later.
+
+**The name doesn't change.** `myrepo-mbp-43` stays `myrepo-mbp-43` on the box —
+the slug records where a workspace came from, and its branch may already be
+pushed. That is also what makes the move safe: a workspace created on the box
+would be `myrepo-box-43`, so the two can sit side by side.
+
+Handover works on a workspace whose agent has already exited, too — name the
+machine with `--from` and luv will move the folder and start it fresh.
+
+| Flag | |
+|---|---|
+| `--to HOST` | Destination; `local` for the machine you're on. Required. |
+| `--from HOST` | Source, when luv's registry doesn't already know |
+| `--no-agent-state` | Move the workspace only |
+| `--no-attach` | Leave the new session detached |
+| `--purge` | Delete the source folder after the copy verifies |
+| `-f` | Replace an existing folder on the destination |
+| `-y` | Skip the "an agent may still be running" confirmation |
+
 ## Session lifecycle
 
 | Step | What happens |
@@ -262,24 +337,35 @@ running.
 
 ## Session naming and identity
 
-Sessions are named after the workspace folder: `~/prs/myrepo-42` becomes
-`luv-myrepo-42`. tmux forbids `.` and `:` in session names, so a repo like
-`foo.js` becomes `luv-foo_js-42`.
+Workspace folders are `{repo}-{machine}-{number}` and branches
+`luv-{machine}-{number}`, where `{machine}` names whichever machine created the
+workspace (config key `machine`, defaulting to the hostname). Each machine works
+out the next number from GitHub's issue counter on its own, so without that slug
+a laptop and a box would routinely pick the same one and push the same branch.
+Folders and branches created before slugs existed keep working — luv looks for
+its own name first, then any other machine's, then the plain `{repo}-{number}`.
+
+Sessions are named after the workspace folder: `~/prs/myrepo-box-42` becomes
+`luv-myrepo-box-42`. tmux forbids `.` and `:` in session names, so a repo like
+`foo.js` becomes `luv-foo_js-box-42`.
 
 When the workspace is already known — reopening by number, `-pr`, or `-l` — the
-laptop uses that name directly and `tmux new-session -A` doubles as "attach if
-it's already running".
+laptop pins the session name down before dispatching, so `tmux new-session -A`
+doubles as "attach if it's already running". It can't compute that name, though,
+since the slug belongs to the machine holding the folder: it takes it from the
+session registry, or asks the host directly, and falls back to the
+`luv-pending-<id>` rename-on-arrival path if the host doesn't answer.
 
 When it isn't known — a brand new workspace, or bare `-n`/`-r` — the laptop uses
 a placeholder `luv-pending-<id>` and the remote renames it once the clone lands.
 If the target name is already taken by another live session, luv keeps the
-session under `luv-myrepo-42-2` and warns rather than failing.
+session under `luv-myrepo-box-42-2` and warns rather than failing.
 
 Each session also carries two tmux options, which is what `luv ls` reads:
 
 ```bash
-tmux show-options -t luv-myrepo-42 -v @luv_id
-tmux show-options -t luv-myrepo-42 -v @luv_workspace
+tmux show-options -t luv-myrepo-box-42 -v @luv_id
+tmux show-options -t luv-myrepo-box-42 -v @luv_workspace
 ```
 
 ## What runs where
@@ -288,6 +374,7 @@ tmux show-options -t luv-myrepo-42 -v @luv_workspace
 |---|---|---|
 | `luv config`, `luv --init` | Always local | – |
 | `luv ls`, `luv continue` | Local, queries remote over SSH | – |
+| `luv handover` | Local, drives both machines over SSH | starts one on the destination |
 | `luv <repo> [prompt]` | Remote | yes |
 | `luv <repo> <n>`, `-pr`, `-l` | Remote | yes |
 | `luv <repo> -n` / `-r` | Remote | yes |
@@ -304,7 +391,7 @@ invocation, `docker compose up` runs *inside* the pane:
 
 - Detaching leaves the containers running.
 - Teardown happens when the agent exits, not when your SSH client goes away.
-- The compose project name is still `luv-{repo}-{number}`, so two workspaces on
+- The compose project name is still `luv-{repo}-{machine}-{number}`, so two workspaces on
   the same repo don't collide.
 
 Install Docker on the remote and add your user to the `docker` group:
@@ -358,11 +445,29 @@ restores the terminal whatever happens to the connection. If you land in this
 state from something else, `reset` (or `stty sane` plus
 `printf '\033[?1003l\033[?1006l\033[?2004l'`) clears it.
 
+**Handover says the destination already has that folder**
+Something with the same name is already there — either the same workspace from
+an earlier handover, or one created on the machine that made this one. Look at
+it first (`ssh box ls ~/prs`), then either `luv --clean` it or pass `-f` to
+replace it.
+
+**After a handover the agent started a fresh conversation**
+luv prints a warning when it can't find a transcript for the workspace. The
+usual cause is the workspace having been opened under a different path than the
+one the agent recorded, or a Codex rollout stored somewhere other than
+`~/.codex/sessions`. The workspace itself is unaffected — the code, branch, and
+uncommitted work all moved.
+
+**Handover left the session down**
+The source folder is never deleted without `--purge`, so restart it where it
+was: `luv <repo> <n> -r -s <source-host>`. luv prints that exact command before
+it starts copying.
+
 **A session is wedged**
 
 ```bash
 ssh box tmux ls                          # see everything, not just luv's
-ssh box tmux kill-session -t luv-myrepo-42
+ssh box tmux kill-session -t luv-myrepo-box-42
 ```
 
 **I'm already inside tmux locally**
