@@ -52,6 +52,10 @@ luv -r my-repo 42
 # Clean up fully-merged workspaces
 luv --clean
 
+# Tear down a finished session: kill its tmux, delete its workspace
+luv rm myrepo-mbp-42
+luv rm --merged        # everything whose PR has landed
+
 # See what's running on your remote machine, and reattach
 luv ls
 luv continue
@@ -78,9 +82,12 @@ With a remote host configured, steps 1–4 happen on that machine inside a tmux 
 | `luv config set\|get\|unset <key> [value]` | Read or write a single setting |
 | `luv config list` | Show all settings |
 | `luv --init` | Configure default GitHub org only |
-| `luv ls [--host H] [--prune]` | List live sessions across hosts |
+| `luv ls [--host H] [--prune] [--no-pr]` | List every live session on every host, with each one's PR link |
 | `luv continue [<repo> [number]]` | Attach to a live session |
 | `luv handover [<repo> [n]] --to HOST` | Move a session to another machine and resume it there |
+| `luv rm <session\|workspace>...` | Kill a session and delete its workspace on its host |
+| `luv rm --merged [--host H] [-f]` | Remove every session whose PR is merged |
+| `luv rm --dead [--host H] [-f]` | Remove workspaces with no live session |
 | `luv [org/]<repo> [prompt...]` | Create a new workspace and launch Claude (default) |
 | `luv --codex [org/]<repo> [prompt...]` | Create a workspace and launch Codex in YOLO mode |
 | `luv [org/]<repo> -b <branch> [prompt...]` | Create a workspace based off `<branch>` instead of the default |
@@ -185,6 +192,8 @@ luv continue                        # reattach exactly where you left off
 
 `luv` re-invokes itself on the remote over SSH, so every flag works there unchanged. The remote needs `luv`, `tmux`, `gh`, and `git` on its `PATH`.
 
+`luv ls` lists what is running on every host it knows about, not only the sessions this machine started — a session dispatched from your laptop shows up on your desktop, and `luv continue` and `luv rm` reach it from either.
+
 Use `--local` for a one-off local run, `-s HOST` to target a different machine, and `-i PATH` for a different SSH key.
 
 ### Handing a session to another machine
@@ -214,6 +223,33 @@ Full guide, including how to prepare a fresh Ubuntu box and set up SSH keys: **[
 Use `luv --clean -f` to skip all safety checks and delete everything. Add `--safe` (i.e. `luv --clean --safe -f`) to restrict force-delete to workspaces whose folder mtime is older than 24 hours, leaving recently-touched workspaces alone.
 
 Workspaces with a live tmux session are skipped unless you pass `-f`.
+
+### Removing a specific session
+
+`luv --clean` is a garbage collector: it decides for itself what is safe to
+delete, and never touches a workspace with a live session. `luv rm` is the
+opposite — you name what goes, and it goes, on whichever host it lives on.
+
+```bash
+luv rm myrepo-mbp-42      # kill its tmux session, delete the folder on its host
+luv rm luv-myrepo-mbp-42  # the session name works too
+luv rm --merged           # every session whose PR has been merged
+luv rm --dead             # workspaces left behind by sessions that already exited
+luv rm --dead --host box  # scope either selector to one machine
+```
+
+A named target is taken as intent and removed without further checks —
+including any uncommitted work in it. The `--merged` and `--dead` selectors
+list what they matched and ask first; `-f` skips that prompt.
+
+`--dead` is the counterpart to `luv ls`: reconciliation drops a session from the
+registry as soon as its tmux session exits, but the clone it was working in
+stays on the remote disk. Those orphans are invisible to `luv ls` and are
+usually what is actually filling up the box.
+
+Only folders ending in `-{N}` are ever eligible — `{repo}-{machine}-{N}` and
+pre-slug `{repo}-{N}` alike. Anything else in the workspace root is left alone,
+and a target that doesn't resolve to one is an error rather than an `rm -rf`.
 
 ## Configuration
 

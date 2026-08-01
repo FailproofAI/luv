@@ -239,7 +239,7 @@ about how you use luv changes:
 ```bash
 luv myrepo "fix the flaky test"     # new workspace on the remote
 luv myrepo 42 "keep going"          # reopen workspace 42 there
-luv ls                              # what's running, across all hosts
+luv ls                              # what's running, on every host, whoever started it
 luv continue                        # attach to a session
 luv continue myrepo                 # attach to the newest myrepo session
 luv continue myrepo 42              # attach to a specific workspace
@@ -331,7 +331,7 @@ machine with `--from` and luv will move the folder and start it fresh.
 |---|---|
 | `luv myrepo "…"` | Laptop records a registry entry, opens SSH, creates the tmux session, remote luv clones and launches the agent |
 | `Ctrl-b d` or lost connection | tmux session keeps running; agent unaffected; Docker containers stay up |
-| `luv ls` | Laptop queries each host's tmux and refreshes the registry |
+| `luv ls` | Laptop queries every known host's tmux and refreshes the registry, adopting sessions another machine started |
 | `luv continue` | Reattaches; other clients are detached so the pane isn't size-clamped |
 | Agent exits | The pane's command ends, tmux session disappears, Docker environment is torn down, `luv ls` prunes the entry on its next run |
 
@@ -427,8 +427,23 @@ discards the command — so the prompt is dropped. luv prints a note when this c
 happen. Type the prompt into the running agent instead.
 
 **`luv ls` says a host is unreachable**
-It shows the last known state rather than pruning; nothing is lost. When a host
-is gone for good, `luv ls --prune` forgets its entries.
+It shows that host's last known state rather than pruning; nothing is lost. A
+configured host with no entries yet has no state to show, so it just says its
+sessions aren't listed. When a host is gone for good, `luv ls --prune` forgets
+its entries — and `luv config unset remote.hosts.<name>` stops the scan.
+
+**Junk like `35;22;1M` appears at my prompt after a dropped connection**
+
+That's mouse-tracking reports. The remote tmux/agent turned mouse tracking on
+in *your* terminal and, having been killed along with the connection, never
+turned it off — so every mouse move now types coordinates at your shell.
+Bracketed paste (`200~` around pastes), a missing cursor, and a stuck
+alternate screen come from the same cause.
+
+luv now cleans this up itself: it stays alive as the parent of `ssh` and
+restores the terminal whatever happens to the connection. If you land in this
+state from something else, `reset` (or `stty sane` plus
+`printf '\033[?1003l\033[?1006l\033[?2004l'`) clears it.
 
 **Handover says the destination already has that folder**
 Something with the same name is already there — either the same workspace from
