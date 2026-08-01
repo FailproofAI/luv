@@ -80,7 +80,7 @@ With a remote host configured, steps 1–4 happen on that machine inside a tmux 
 | `luv config set\|get\|unset <key> [value]` | Read or write a single setting |
 | `luv config list` | Show all settings |
 | `luv --init` | Configure default GitHub org only |
-| `luv ls [--host H] [--prune] [--no-pr]` | List live sessions across hosts, with each one's PR link |
+| `luv ls [--host H] [--prune] [--no-pr]` | List every live session on every host, with each one's PR link |
 | `luv continue [<repo> [number]]` | Attach to a live session |
 | `luv rm <session\|workspace>...` | Kill a session and delete its workspace on its host |
 | `luv rm --merged [--host H] [-f]` | Remove every session whose PR is merged |
@@ -177,6 +177,8 @@ luv continue                        # reattach exactly where you left off
 ```
 
 `luv` re-invokes itself on the remote over SSH, so every flag works there unchanged. The remote needs `luv`, `tmux`, `gh`, and `git` on its `PATH`.
+
+`luv ls` lists what is running on every host it knows about, not only the sessions this machine started — a session dispatched from your laptop shows up on your desktop, and `luv continue` and `luv rm` reach it from either.
 
 Use `--local` for a one-off local run, `-s HOST` to target a different machine, and `-i PATH` for a different SSH key.
 
