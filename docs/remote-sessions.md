@@ -256,6 +256,19 @@ luv -i ~/.ssh/other_key myrepo      # use a different key this once
 Detach from a session with `Ctrl-b d` (tmux's default prefix). The agent keeps
 running.
 
+When a session ends on its own — the connection drops, ssh is killed, the pane
+dies — luv prints the way back in, already filled in for that session:
+
+```
+luv: session ended unexpectedly — continue it with:
+
+    luv continue myrepo 42
+```
+
+Copy that line and run it. If the agent took the tmux session down with it,
+there is nothing left to attach to; `luv continue` says so and hands you
+`luv myrepo 42 -r`, which reopens the workspace and resumes the conversation.
+
 ## Reaching servers the agent started
 
 An agent working on the remote starts servers there — a dev server, a compose
@@ -409,7 +422,7 @@ machine with `--from` and luv will move the folder and start it fresh.
 | Step | What happens |
 |---|---|
 | `luv myrepo "…"` | Laptop records a registry entry, opens SSH, creates the tmux session, remote luv clones and launches the agent |
-| `Ctrl-b d` or lost connection | tmux session keeps running; agent unaffected; Docker containers stay up |
+| `Ctrl-b d` or lost connection | tmux session keeps running; agent unaffected; Docker containers stay up. A connection that broke leaves the exact `luv continue <repo> <n>` for it in your terminal |
 | `luv ls` | Laptop queries every known host's tmux and refreshes the registry, adopting sessions another machine started |
 | `luv continue` | Reattaches; other clients are detached so the pane isn't size-clamped |
 | Agent exits | The pane's command ends, tmux session disappears, Docker environment is torn down, `luv ls` prunes the entry on its next run |
