@@ -345,19 +345,27 @@ a laptop and a box would routinely pick the same one and push the same branch.
 Folders and branches created before slugs existed keep working — luv looks for
 its own name first, then any other machine's, then the plain `{repo}-{number}`.
 
+`luv -l <PR URL>` clones into a folder of its own every time, so a second run on
+the same PR gets `{repo}-{machine}-{number}_2`, a third `_3`. The suffix is part
+of the number's segment, so those folders are still workspace `{number}`
+everywhere it matters — `luv ls`, `luv rm`, `--clean`, handover. Where a number
+has several copies, the newest wins: that is the one you just made.
+
 Sessions are named after the workspace folder: `~/prs/myrepo-box-42` becomes
 `luv-myrepo-box-42`. tmux forbids `.` and `:` in session names, so a repo like
 `foo.js` becomes `luv-foo_js-box-42`.
 
-When the workspace is already known — reopening by number, `-pr`, or `-l` — the
-laptop pins the session name down before dispatching, so `tmux new-session -A`
-doubles as "attach if it's already running". It can't compute that name, though,
-since the slug belongs to the machine holding the folder: it takes it from the
-session registry, or asks the host directly, and falls back to the
+When the workspace is already known — reopening by number, `-pr`, or `-l -r` —
+the laptop pins the session name down before dispatching, so `tmux new-session
+-A` doubles as "attach if it's already running". It can't compute that name,
+though, since the slug belongs to the machine holding the folder: it takes it
+from the session registry, or asks the host directly, and falls back to the
 `luv-pending-<id>` rename-on-arrival path if the host doesn't answer.
 
-When it isn't known — a brand new workspace, or bare `-n`/`-r` — the laptop uses
-a placeholder `luv-pending-<id>` and the remote renames it once the clone lands.
+When it isn't known — a brand new workspace, plain `luv -l` (whose folder the
+remote only picks once it sees what is already there), or bare `-n`/`-r` — the
+laptop uses a placeholder `luv-pending-<id>` and the remote renames it once the
+clone lands.
 If the target name is already taken by another live session, luv keeps the
 session under `luv-myrepo-box-42-2` and warns rather than failing.
 
