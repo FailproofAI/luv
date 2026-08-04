@@ -1,23 +1,111 @@
 name: Publish to PyPI
 
+# Two ways in.
+#
+#   * A push to main publishes when the version in pyproject.toml is one no tag
+#     exists for yet. That is what makes a merged version bump release itself.
+#   * A v* tag publishes whatever it points at, kept so a release can still be
+#     cut by hand.
+#
+# The tag is created here rather than by a separate workflow because a tag
+# pushed with GITHUB_TOKEN does not trigger other workflows — GitHub's recursion
+# guard. Tagging elsewhere and relying on the v* trigger to fire would leave the
+# tag in place and nothing published, which is the worst of both.
+#
+# Deliberately no `paths:` filter. It would be evaluated for tag pushes as well,
+# so `paths: [pyproject.toml]` would silently drop a hand-pushed tag whose commit
+# did not happen to touch that file. The "is this already tagged" check below is
+# the real guard; a filter would only be an optimisation, and a lossy one.
+
 on:
   push:
     tags:
       - "v*"
+    branches:
+      - main
 
-permissions:
-  id-token: write
+concurrency:
+  group: publish
+  cancel-in-progress: false
 
 jobs:
-  publish:
+  decide:
     runs-on: ubuntu-latest
-    environment: pypi
+    permissions:
+      contents: read
+    outputs:
+      publish: ${{ steps.resolve.outputs.publish }}
+      version: ${{ steps.resolve.outputs.version }}
+      needs_tag: ${{ steps.resolve.outputs.needs_tag }}
     steps:
+      # Its own job so the pypi environment — which may require a reviewer — is
+      # never entered by a run that turns out to have nothing to publish.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # tags, so the guard below can see them
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Work out whether there is a release to make
+        id: resolve
+        run: |
+          set -euo pipefail
+
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+            needs_tag=false
+          else
+            version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')"
+            needs_tag=true
+          fi
+
+          if [ -z "${version}" ]; then
+            echo "could not determine a version to publish" >&2
+            exit 1
+          fi
+
+          if [ "${needs_tag}" = true ] && git rev-parse -q --verify "refs/tags/v${version}" >/dev/null; then
+            echo "v${version} is already tagged — nothing to release"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "releasing ${version}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "needs_tag=${needs_tag}" >> "$GITHUB_OUTPUT"
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+
+  publish:
+    needs: decide
+    if: needs.decide.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: write # push the tag a merged version bump implies
+      id-token: write # PyPI trusted publishing
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Before the build, so a tag that cannot be pushed — protected tags, say —
+      # fails the run rather than publishing a version with no tag to show for it.
+      - name: Tag the release
+        if: needs.decide.outputs.needs_tag == 'true'
+        env:
+          VERSION: ${{ needs.decide.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "v${VERSION}" -m "v${VERSION}"
+          git push origin "v${VERSION}"
 
       - name: Install build tools
         run: pip install build
