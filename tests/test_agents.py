@@ -387,6 +387,142 @@ class TerminalRestoreTests(unittest.TestCase):
         self.assertNotEqual(hand_over.call_args.kwargs.get("restore"), False)
 
 
+class _OrderedStderr(io.StringIO):
+    """A stderr that notes where its first write falls in a sequence."""
+
+    def __init__(self, order):
+        super().__init__()
+        self.order = order
+
+    def write(self, s):
+        if s.strip() and "hint" not in self.order:
+            self.order.append("hint")
+        return super().write(s)
+
+
+class ContinueHintTests(unittest.TestCase):
+    """A session that breaks must say how to get back into it, in one line
+    that can be copied off the terminal and run as-is."""
+
+    FD = TerminalRestoreTests.FD
+    SAVED = TerminalRestoreTests.SAVED
+    HINT = "luv continue myrepo 42"
+
+    def _hand_over(self, stderr, **kwargs):
+        """Run hand_over over a fake child, with the terminal all stubbed out."""
+        with (patch.object(luv, "terminal_fd", return_value=self.FD),
+              patch.object(luv.subprocess, "Popen",
+                           return_value=_FakeProc(kwargs.pop("returncode", 0))),
+              patch.object(luv.termios, "tcgetattr", return_value=self.SAVED),
+              patch.object(luv.termios, "tcsetattr"),
+              patch.object(luv.os, "write", side_effect=self.on_write),
+              contextlib.redirect_stderr(stderr),
+              self.assertRaises(SystemExit) as exit_ctx):
+            luv.hand_over(["/bin/ssh", "box"], **kwargs)
+        return exit_ctx.exception.code
+
+    def on_write(self, fd, data):
+        return len(data)
+
+    def test_broken_session_hands_back_a_runnable_command(self):
+        err = io.StringIO()
+        code = self._hand_over(err, returncode=255, hint=self.HINT)
+
+        self.assertEqual(code, 255)
+        self.assertIn(self.HINT, err.getvalue())
+        # Copy-pasteable means the whole command sits on a line of its own, with
+        # nothing but indentation around it to select past.
+        line = next(l for l in err.getvalue().splitlines() if self.HINT in l)
+        self.assertEqual(line.strip(), self.HINT)
+
+    def test_a_clean_exit_says_nothing(self):
+        # Detaching and the agent finishing both land here; neither is broken.
+        err = io.StringIO()
+        code = self._hand_over(err, returncode=0, hint=self.HINT)
+
+        self.assertEqual(code, 0)
+        self.assertNotIn("luv continue", err.getvalue())
+
+    def test_the_hint_waits_for_the_terminal_to_be_restored(self):
+        # Printed inside the guard it would land in the remote program's modes,
+        # which is where unreadable output comes from in the first place.
+        order = []
+        self.on_write = lambda fd, data: order.append("reset")
+        self._hand_over(_OrderedStderr(order), returncode=255, hint=self.HINT)
+
+        self.assertEqual(order, ["reset", "hint"])
+
+    def test_hint_names_the_repo_and_number_it_knows(self):
+        self.assertEqual(luv.continue_hint("myrepo", "myrepo-box-42"),
+                         "luv continue myrepo 42")
+        self.assertEqual(luv.continue_hint("myrepo", "myrepo-42"),
+                         "luv continue myrepo 42", "pre-slug folders too")
+
+    def test_hint_degrades_to_what_is_known(self):
+        # A brand-new workspace has no number until the remote picks one, and an
+        # adopted session may not even have a repo. Both shorter forms still run.
+        self.assertEqual(luv.continue_hint("myrepo", "luv-pending-abc123"),
+                         "luv continue myrepo")
+        self.assertEqual(luv.continue_hint("myrepo", None), "luv continue myrepo")
+        self.assertEqual(luv.continue_hint(None, "myrepo-box-42"), "luv continue")
+
+    def test_remote_session_carries_its_own_hint(self):
+        with (patch.object(luv.shutil, "which", side_effect=lambda n: f"/bin/{n}"),
+              patch.object(luv, "record_session"),
+              patch.object(luv, "port_watch", return_value=None),
+              patch.object(luv, "hand_over") as hand_over,
+              contextlib.redirect_stdout(io.StringIO())):
+            luv.dispatch_remote({"host": "box"}, ["myrepo", "42"],
+                                workspace="myrepo-box-42",
+                                meta={"repo": "myrepo", "org": "acme"})
+
+        self.assertEqual(hand_over.call_args.kwargs.get("hint"),
+                         "luv continue myrepo 42")
+
+    def test_a_run_with_no_session_behind_it_gets_no_hint(self):
+        # -nit streams to a pipe and exits; there is nothing to continue.
+        with (patch.object(luv.shutil, "which", side_effect=lambda n: f"/bin/{n}"),
+              patch.object(luv, "port_watch", return_value=None),
+              patch.object(luv, "hand_over") as hand_over,
+              contextlib.redirect_stdout(io.StringIO())):
+            luv.dispatch_remote({"host": "box"}, ["myrepo", "42", "-nit"],
+                                use_tmux=False, tty=False)
+
+        self.assertIsNone(hand_over.call_args.kwargs.get("hint"))
+
+    def test_attaching_carries_the_hint_for_the_session_it_picked(self):
+        row = {"host": "box", "session": "luv-myrepo-42", "live": True,
+               "repo": "myrepo", "workspace": "myrepo-box-42"}
+        with (patch.object(luv, "refresh_sessions", return_value=([row], set())),
+              patch.object(luv, "resolve_host", return_value={"host": "box"}),
+              patch.object(luv, "attach_session") as attach,
+              contextlib.redirect_stdout(io.StringIO())):
+            luv.cmd_continue(["myrepo", "42"])
+
+        self.assertEqual(attach.call_args.kwargs.get("hint"),
+                         "luv continue myrepo 42")
+
+    def test_a_session_that_is_already_gone_points_at_the_reopen(self):
+        # Where the hint lands when the agent took the tmux session down with
+        # it: the workspace outlives the session, so pass the user on.
+        with (patch.object(luv, "refresh_sessions", return_value=([], set())),
+              contextlib.redirect_stdout(io.StringIO())):
+            with self.assertRaises(SystemExit):
+                with contextlib.redirect_stderr(io.StringIO()) as err:
+                    luv.cmd_continue(["myrepo", "42"])
+
+        self.assertIn("luv myrepo 42 -r", err.getvalue())
+
+    def test_nothing_live_at_all_suggests_nothing(self):
+        with (patch.object(luv, "refresh_sessions", return_value=([], set())),
+              contextlib.redirect_stdout(io.StringIO())):
+            with self.assertRaises(SystemExit):
+                with contextlib.redirect_stderr(io.StringIO()) as err:
+                    luv.cmd_continue([])
+
+        self.assertNotIn("-r", err.getvalue())
+
+
 class SessionNameTests(unittest.TestCase):
     def test_illegal_tmux_characters_are_replaced(self):
         self.assertEqual(luv.tmux_session_name("foo.js-7"), "luv-foo_js-7")

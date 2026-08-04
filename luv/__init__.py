@@ -1585,7 +1585,36 @@ def terminal_guard():
                 os.write(fd, TERM_RESET.encode())
 
 
-def hand_over(argv: list[str], *, restore: bool = True, watch=None) -> None:
+def continue_hint(repo: str | None, workspace: str | None = None) -> str:
+    """The 'luv continue …' line to hand back when a session breaks.
+
+    As narrow as what we actually know, and no narrower: the number is read off
+    the workspace folder, which a session dispatched before the remote picked
+    one doesn't have yet. Every shorter form is still a command that works —
+    a repo alone takes its newest session, and bare 'luv continue' asks.
+    """
+    parts = ["luv", "continue"]
+    if repo:
+        parts.append(repo)
+        number = workspace_number(repo, workspace or "")
+        if number is not None:
+            parts.append(str(number))
+    return " ".join(parts)
+
+
+def reopen_hint(args: list[str]) -> str:
+    """The 'luv <repo> [n] -r' line for a session whose tmux is already gone.
+
+    Takes the same [<repo> [number]] grammar 'luv continue' does, so whatever
+    was just typed carries straight over to the command that still works.
+    """
+    repo = args[0].rstrip("/").rsplit("/", 1)[-1]
+    number = args[1] if len(args) > 1 and args[1].isdigit() else None
+    return " ".join(["luv", repo] + ([number] if number else []) + ["-r"])
+
+
+def hand_over(argv: list[str], *, restore: bool = True, watch=None,
+              hint: str | None = None) -> None:
     """Give the terminal to a child and exit with its status. Never returns.
 
     Without `restore` this is a plain execv, which is the better deal when
@@ -1604,6 +1633,12 @@ def hand_over(argv: list[str], *, restore: bool = True, watch=None) -> None:
     the agent starts ten minutes in. It runs on a daemon thread and touches
     neither the terminal nor termios — this path is the one that has to stay
     boring.
+
+    `hint` is the way back in, printed when the child exits badly. A clean exit
+    is either a detach or the agent finishing, and neither wants advice; a bad
+    one is usually ssh losing the connection out from under a session that is
+    still running on the other side, and the terminal it lands back in should
+    not have to be told twice how to get there.
     """
     if not restore:
         os.execv(argv[0], argv)
@@ -1620,19 +1655,25 @@ def hand_over(argv: list[str], *, restore: bool = True, watch=None) -> None:
                     # The child got this same Ctrl-C from the tty and decides
                     # for itself what to do with it; outliving it is the point.
                     continue
+        if code != 0 and hint:
+            # After the guard, not inside it: a terminal still in the remote
+            # program's modes is no place to print something to be copied.
+            print(f"\nluv: session ended unexpectedly — continue it with:\n\n"
+                  f"    {hint}\n", file=sys.stderr)
         sys.exit(code)
 
 
-def exec_ssh(hc: dict, remote_cmd: str, *, tty: bool = True, watch=None) -> None:
+def exec_ssh(hc: dict, remote_cmd: str, *, tty: bool = True, watch=None,
+             hint: str | None = None) -> None:
     """Hand the terminal to ssh. Never returns."""
     ssh_bin = shutil.which("ssh")
     if not ssh_bin:
         die("'ssh' not found in PATH")
     argv = ssh_base(hc, tty=tty) + [remote_shell(remote_cmd)]
-    hand_over([ssh_bin] + argv[1:], restore=tty, watch=watch)
+    hand_over([ssh_bin] + argv[1:], restore=tty, watch=watch, hint=hint)
 
 
-def attach_session(hc: dict | None, name: str) -> None:
+def attach_session(hc: dict | None, name: str, *, hint: str | None = None) -> None:
     """Attach to a tmux session, locally or over ssh. Never returns.
 
     -d detaches other clients so the pane isn't size-clamped to a stale window
@@ -1642,11 +1683,11 @@ def attach_session(hc: dict | None, name: str) -> None:
         tmux_bin = shutil.which("tmux")
         if not tmux_bin:
             die("'tmux' not found in PATH")
-        hand_over([tmux_bin, "attach", "-d", "-t", name])
+        hand_over([tmux_bin, "attach", "-d", "-t", name], hint=hint)
         return
     print(f"luv: attaching {name} on {hc['host']}")
     exec_ssh(hc, shlex.join(["tmux", "attach", "-d", "-t", name]),
-             watch=port_watch(hc, session=name))
+             watch=port_watch(hc, session=name), hint=hint)
 
 
 def remote_prompt(args: list[str]) -> str | None:
@@ -1758,14 +1799,18 @@ def dispatch_remote(hc: dict, remote_args: list[str], *, workspace: str | None =
         record_session({**meta, "id": sid, "host": hc["host"], "session": session,
                         "workspace": workspace, "created": int(time.time())})
 
+    # Only a tmux session is there to come back to; -nit and --clean run to
+    # completion over ssh and have nothing to continue.
+    hint = continue_hint((meta or {}).get("repo"), workspace) if use_tmux else None
     print(f"luv: {hc['host']} — {session or 'no tmux'}")
     if detach:
         r = run(ssh_base(hc, batch=True) + [remote_shell(cmd)])
         if r.returncode != 0:
             die(f"could not start {session} on {hc['host']}: {r.stderr.strip()}")
-        print(f"luv: started detached — 'luv continue' to attach")
+        print(f"luv: started detached — attach with: {hint or 'luv continue'}")
         return
-    exec_ssh(hc, cmd, tty=tty, watch=port_watch(hc, sid=sid, session=session))
+    exec_ssh(hc, cmd, tty=tty, watch=port_watch(hc, sid=sid, session=session),
+             hint=hint)
 
 
 def cmd_paths() -> None:
@@ -3145,14 +3190,21 @@ def cmd_continue(args: list[str], identity: str | None = None) -> None:
     live, label = filter_sessions([s for s in sessions if s.get("live")], args)
 
     if not live:
-        die(f"no live luv sessions{label}")
+        # This is where a hint printed after a crash lands when the agent took
+        # the tmux session down with it, so send it on rather than stopping at
+        # the bad news: the workspace outlives the session, and -r reopens it.
+        named = bool(args) and not args[0].startswith("-")
+        die(f"no live luv sessions{label}"
+            + (f" — if its workspace is still there: {reopen_hint(args)}"
+               if named else ""))
     live.sort(key=session_sort_key, reverse=True)
 
     # An explicit repo means "the newest one for it".
     target = live[0] if (len(live) == 1 or args) else choose_session(live)
 
     host = target.get("host")
-    attach_session(resolve_host(host, identity) if host else None, target["session"])
+    attach_session(resolve_host(host, identity) if host else None, target["session"],
+                   hint=continue_hint(target.get("repo"), target.get("workspace")))
 
 
 def start_local_session(workspace: str, luv_args: list[str], meta: dict,
@@ -3170,13 +3222,14 @@ def start_local_session(workspace: str, luv_args: list[str], meta: dict,
              shutil.which("luv") or "luv"] + luv_args
     argv = [tmux_bin, "new-session"] + ([] if attach else ["-d"]) + \
            ["-A", "-s", session, "--"] + inner
+    hint = continue_hint(meta.get("repo"), workspace)
     print(f"luv: local — {session}")
     if attach:
-        os.execv(tmux_bin, argv)
+        hand_over(argv, hint=hint)
     r = subprocess.run(argv)
     if r.returncode != 0:
         die(f"could not start {session}")
-    print("luv: started detached — 'luv continue' to attach")
+    print(f"luv: started detached — attach with: {hint}")
 
 
 def workspace_origin(hc: dict | None, ws: Path) -> tuple[str, str] | None:
@@ -3471,7 +3524,8 @@ Remote:
   Once 'luv config' has a remote host, every workspace command runs there inside
   a tmux session that survives disconnects. 'luv ls' shows what is running on
   every host — including sessions started from another machine — and
-  'luv continue' reattaches. Use --local for a one-off local run.
+  'luv continue' reattaches. A session that ends badly prints the exact
+  'luv continue <repo> <n>' for itself. Use --local for a one-off local run.
   'luv handover' moves a running session — workspace, uncommitted work, and the
   agent's conversation — to another machine, then resumes it there.
   Requires luv, tmux, gh and git on the remote. See docs/remote-sessions.md.
