@@ -218,9 +218,28 @@ def machine_slug() -> str:
     return sanitize_slug(socket.gethostname().split(".")[0]) or "local"
 
 
-def workspace_name(repo: str, number: int, slug: str | None = None) -> str:
-    """Folder name for a workspace: '{repo}-{machine}-{number}'."""
-    return f"{repo}-{slug or machine_slug()}-{number}"
+def workspace_name(repo: str, number: int, slug: str | None = None,
+                   copy: int = 1) -> str:
+    """Folder name for a workspace: '{repo}-{machine}-{number}[_{copy}]'.
+
+    The copy suffix exists for `luv -l`, which clones a PR into a folder of its
+    own every time rather than reopening the one already there. '_' is the one
+    separator that survives every name derived from this: tmux forbids '.' and
+    ':' in session names, and Compose project names forbid '.' too.
+    """
+    base = f"{repo}-{slug or machine_slug()}-{number}"
+    return base if copy <= 1 else f"{base}_{copy}"
+
+
+def next_workspace_dir(repo: str, number: int) -> Path:
+    """A workspace path for this number that nothing occupies yet.
+
+    Second and later clones of the same PR land on '..._2', '..._3', and so on.
+    """
+    copy = 1
+    while (PRS_DIR / workspace_name(repo, number, copy=copy)).exists():
+        copy += 1
+    return PRS_DIR / workspace_name(repo, number, copy=copy)
 
 
 def branch_name(number: int, slug: str | None = None) -> str:
@@ -233,9 +252,10 @@ def workspace_re(repo: str) -> re.Pattern:
 
     The repo name is known at every call site, so it can be anchored — which is
     what makes the optional middle group unambiguous. Group 1 is the slug (None
-    for a pre-slug folder), group 2 the number.
+    for a pre-slug folder), group 2 the number, group 3 the copy index (None for
+    the first clone of that number).
     """
-    return re.compile(rf"^{re.escape(repo)}-(?:([a-z0-9]+)-)?(\d+)$")
+    return re.compile(rf"^{re.escape(repo)}-(?:([a-z0-9]+)-)?(\d+)(?:_(\d+))?$")
 
 
 def branch_re(number: int) -> re.Pattern:
@@ -262,34 +282,44 @@ def find_workspace(repo: str, number: int) -> Path | None:
     """Locate an existing workspace folder for {repo}-{number}, or None.
 
     Ours first, then one that arrived here by handover (it keeps the slug of the
-    machine that created it), then a pre-slug folder. Two foreign candidates is
-    genuinely ambiguous — the number alone cannot say which was meant.
+    machine that created it), then a pre-slug folder. Where `luv -l` has cloned
+    the same PR more than once, the newest copy wins — that is the one you just
+    made. Two foreign *machines* is still genuinely ambiguous: the number alone
+    cannot say which was meant.
     """
-    mine = PRS_DIR / workspace_name(repo, number)
-    if mine.is_dir():
-        return mine
     if not PRS_DIR.exists():
         return None
 
     pattern = workspace_re(repo)
-    foreign, legacy = [], None
+    mine = machine_slug()
+    ours: list[tuple[int, Path]] = []
+    foreign: dict[str, list[tuple[int, Path]]] = {}
+    legacy = None
     for entry in sorted(PRS_DIR.iterdir()):
         if not entry.is_dir():
             continue
         m = pattern.match(entry.name)
         if not m or int(m.group(2)) != number:
             continue
-        if m.group(1) is None:
+        slug, copy = m.group(1), int(m.group(3) or 1)
+        if slug is None:
             legacy = entry
+        elif slug == mine:
+            ours.append((copy, entry))
         else:
-            foreign.append(entry)
+            foreign.setdefault(slug, []).append((copy, entry))
 
+    def newest(copies: list[tuple[int, Path]]) -> Path:
+        return max(copies, key=lambda c: c[0])[1]
+
+    if ours:
+        return newest(ours)
     if len(foreign) > 1:
-        names = ", ".join(e.name for e in foreign)
+        names = ", ".join(sorted(e.name for c in foreign.values() for _, e in c))
         die(f"ambiguous workspace for '{repo}' {number}: {names}\n"
             f"       open one by name with 'luv {repo} -n' or remove the stale folder")
     if foreign:
-        return foreign[0]
+        return newest(next(iter(foreign.values())))
     return legacy
 
 
@@ -335,13 +365,17 @@ def folder_number(name: str | None) -> int | None:
     the orphan scan, `--clean` — are looking at a directory listing and have no
     repo to anchor on. Where the repo *is* known, workspace_number reads the
     slug too and should be preferred.
+
+    A '_{copy}' suffix is part of the number's segment, so it is stripped here
+    too: '{repo}-{slug}-41_2' is still workspace 41.
     """
     if not name:
         return None
     parts = name.rsplit("-", 1)
-    if len(parts) != 2 or not parts[1].isdigit():
+    if len(parts) != 2:
         return None
-    return int(parts[1])
+    m = re.match(r"^(\d+)(?:_\d+)?$", parts[1])
+    return int(m.group(1)) if m else None
 
 
 def parse_github_url(url: str) -> tuple[str, str] | None:
@@ -1316,21 +1350,23 @@ def find_latest_clone(repo: str) -> Path | None:
     """Return the highest-numbered local workspace for a repo, or None.
 
     Slugged and pre-slug folders compete on the number alone; a tie between our
-    own slug and one that arrived by handover goes to ours.
+    own slug and one that arrived by handover goes to ours, and a tie between
+    two clones of the same PR goes to the newest copy.
     """
     if not PRS_DIR.exists():
         return None
     pattern = workspace_re(repo)
     mine = machine_slug()
     best: Path | None = None
-    best_key = (-1, -1)
+    best_key = (-1, -1, -1)
     for entry in sorted(PRS_DIR.iterdir()):
         if not entry.is_dir():
             continue
         m = pattern.match(entry.name)
         if not m:
             continue
-        key = (int(m.group(2)), 1 if m.group(1) == mine else 0)
+        key = (int(m.group(2)), 1 if m.group(1) == mine else 0,
+               int(m.group(3) or 1))
         if key > best_key:
             best, best_key = entry, key
     return best
@@ -1393,12 +1429,20 @@ def open_existing(org: str, repo: str, number: int, prompt: str | None, nav_mode
         launch(clone_dir, prompt, plan_mode=plan_mode, non_interactive=non_interactive, extra_env=extra_env, model=model, agent=agent)
 
 
-def open_pr(org: str, repo: str, number: int, prompt: str | None, nav_mode: bool = False, resume_mode: bool = False, plan_mode: bool = False, non_interactive: bool = False, extra_env: dict[str, str] | None = None, model: str | None = None, agent: str = "claude") -> None:
-    """Open any GitHub PR by org/repo/number, cloning if needed."""
+def open_pr(org: str, repo: str, number: int, prompt: str | None, nav_mode: bool = False, resume_mode: bool = False, plan_mode: bool = False, non_interactive: bool = False, extra_env: dict[str, str] | None = None, model: str | None = None, agent: str = "claude", fresh: bool = False) -> None:
+    """Open any GitHub PR by org/repo/number, cloning if needed.
+
+    With fresh=True — how `luv -l` calls this — an existing folder for the same
+    number is left alone and the PR is cloned again next to it. A URL you paste
+    is a request to look at that PR as it is *now*, and a folder from last week
+    sits on whatever was checked out then. -r is the exception: resuming means
+    picking up a conversation, and a conversation lives in the folder it was
+    held in.
+    """
     extra_env = extra_env or {}
     clone_dir = find_workspace(repo, number)
 
-    if clone_dir is not None:
+    if clone_dir is not None and (resume_mode or not fresh):
         print(f"luv: opening existing folder {clone_dir.name}")
         ensure_pr_rules(agent)
         if nav_mode:
@@ -1415,9 +1459,15 @@ def open_pr(org: str, repo: str, number: int, prompt: str | None, nav_mode: bool
         die(f"PR {org}/{repo}#{number} not found.\n{r.stderr.strip()}")
     pr_data = json.loads(r.stdout)
     branch = pr_data["head"]["ref"]
-    clone_url = pr_data["head"]["repo"]["clone_url"]
+    # A fork whose repo has since been deleted comes back as head.repo = null.
+    head_repo = pr_data["head"].get("repo") or {}
+    clone_url = head_repo.get("clone_url")
+    if not clone_url:
+        die(f"PR {org}/{repo}#{number} has no head repository — "
+            "the fork it came from was deleted")
+    base_url = (pr_data.get("base", {}).get("repo") or {}).get("clone_url")
 
-    clone_dir = PRS_DIR / workspace_name(repo, number)
+    clone_dir = next_workspace_dir(repo, number)
     PRS_DIR.mkdir(parents=True, exist_ok=True)
     print(f"luv: cloning {clone_url} -> {clone_dir} (branch {branch})")
     r = subprocess.run(["git", "clone", clone_url, str(clone_dir)])
@@ -1426,6 +1476,20 @@ def open_pr(org: str, repo: str, number: int, prompt: str | None, nav_mode: bool
     r = subprocess.run(["git", "checkout", branch], cwd=str(clone_dir))
     if r.returncode != 0:
         die(f"git checkout {branch} failed (exit {r.returncode})")
+
+    # A clone of the head repo has every branch that repo has — but for a PR
+    # from a fork that is not where the base branch lives, so there would be
+    # nothing to diff or rebase against. Fetch the base repo alongside it.
+    if base_url and base_url != clone_url:
+        print(f"luv: fetching base repo {base_url} as 'upstream'")
+        for cmd in (["git", "remote", "add", "upstream", base_url],
+                    ["git", "fetch", "upstream"]):
+            r = subprocess.run(cmd, cwd=str(clone_dir))
+            if r.returncode != 0:
+                print(f"luv: warning: {' '.join(cmd[:3])} failed "
+                      f"(exit {r.returncode}) — upstream branches unavailable",
+                      file=sys.stderr)
+                break
 
     print(f"luv: ready — {clone_dir.name}, branch {branch}")
     ensure_pr_rules(agent)
@@ -2547,8 +2611,8 @@ Commands:
   luv [org/]<repo> [prompt...]            create a new PR workspace
   luv [org/]<repo> -b <branch> [prompt]   create a workspace based off <branch>
   luv [org/]<repo> <number> [prompt]      reopen an existing work folder by number
-  luv -l <PR URL> [prompt]                open any GitHub PR by URL
-  luv [org/]<repo> -pr <number> [prompt]  open a GitHub PR by repo + number
+  luv -l <PR URL> [prompt]                clone any GitHub PR by URL into a fresh folder
+  luv [org/]<repo> -pr <number> [prompt]  open a GitHub PR by repo + number (reuses its folder)
   luv [org/]<repo> -n                     open shell in latest local clone
   luv [org/]<repo> -r                     resume the selected agent in latest local clone
   luv --clean [-f] [--safe]               delete fully-pushed work folders
@@ -2654,7 +2718,13 @@ Docker:
             m = re.match(r"https://github\.com/([^/]+)/([^/]+)/pull/(\d+)", args[1])
             if m:
                 org_hint, repo_hint = m.group(1), m.group(2)
-                number = pr_hint = int(m.group(3))
+                pr_hint = int(m.group(3))
+                # -l clones into a folder of its own every time, so the name is
+                # only knowable once the remote has picked it — leave it on the
+                # luv-pending path, which renames the session on arrival. -r is
+                # the exception: it reopens the newest folder already there.
+                if resume_mode:
+                    number = pr_hint
         elif repo_hint and "-pr" in args:
             idx = args.index("-pr")
             if idx + 1 < len(args) and args[idx + 1].isdigit():
@@ -2708,7 +2778,7 @@ Docker:
             die(f"cannot parse PR URL: {url}")
         org, repo, number = m.group(1), m.group(2), int(m.group(3))
         prompt = " ".join(args[2:]) or None
-        open_pr(org, repo, number, prompt, nav_mode, resume_mode, plan_mode, non_interactive, extra_env=extra_env, model=model, agent=agent)
+        open_pr(org, repo, number, prompt, nav_mode, resume_mode, plan_mode, non_interactive, extra_env=extra_env, model=model, agent=agent, fresh=True)
         return
 
     raw = args[0].rstrip("/")

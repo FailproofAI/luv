@@ -40,7 +40,7 @@ luv other-org/my-repo "fix the bug"
 # Reopen workspace #42
 luv my-repo 42
 
-# Open any GitHub PR by URL
+# Clone any GitHub PR by URL into a fresh workspace
 luv -l https://github.com/org/repo/pull/123
 
 # Open a shell instead of Claude
@@ -74,6 +74,22 @@ The machine name is what keeps two computers apart. Each one works out the next 
 
 With a remote host configured, steps 1–4 happen on that machine inside a tmux session instead — see [Remote sessions](#remote-sessions).
 
+### Opening an existing PR
+
+`luv -l <PR URL>` gives you the PR as it is *right now*: a full clone into a
+workspace of its own, checked out on the PR's head branch. It never reuses a
+folder that happens to be sitting there — a URL you paste is a request to look
+at that PR, not at whatever was checked out in `myrepo-mbp-123` last week. Run
+it twice on the same PR and you get `myrepo-mbp-123` and `myrepo-mbp-123_2`,
+which are independent workspaces you can run side by side. When the PR comes
+from a fork, the base repo is added as `upstream` and fetched too, so the branch
+you need to diff or rebase against is there.
+
+`-r` is the exception: resuming means picking up a conversation, and a
+conversation lives in the folder it was held in, so `luv -l <URL> -r` reopens the
+newest workspace for that PR instead of cloning another. `luv <repo> -pr <N>`
+also keeps reusing its workspace — it names a workspace, where a URL names a PR.
+
 ## Commands
 
 | Command | Description |
@@ -92,8 +108,8 @@ With a remote host configured, steps 1–4 happen on that machine inside a tmux 
 | `luv --codex [org/]<repo> [prompt...]` | Create a workspace and launch Codex in YOLO mode |
 | `luv [org/]<repo> -b <branch> [prompt...]` | Create a workspace based off `<branch>` instead of the default |
 | `luv [org/]<repo> <number> [prompt]` | Reopen an existing workspace |
-| `luv -l <PR URL> [prompt]` | Open any GitHub PR by URL |
-| `luv [org/]<repo> -pr <number> [prompt]` | Open a PR by repo + number |
+| `luv -l <PR URL> [prompt]` | Clone any GitHub PR by URL into a fresh workspace |
+| `luv [org/]<repo> -pr <number> [prompt]` | Open a PR by repo + number, reusing its workspace |
 | `luv --clean` | Delete workspaces where the branch is fully pushed/merged |
 | `luv --clean -f` | Force delete all workspaces |
 | `luv --clean --safe -f` | Force delete only workspaces older than 24h |
@@ -247,9 +263,10 @@ registry as soon as its tmux session exits, but the clone it was working in
 stays on the remote disk. Those orphans are invisible to `luv ls` and are
 usually what is actually filling up the box.
 
-Only folders ending in `-{N}` are ever eligible — `{repo}-{machine}-{N}` and
-pre-slug `{repo}-{N}` alike. Anything else in the workspace root is left alone,
-and a target that doesn't resolve to one is an error rather than an `rm -rf`.
+Only folders ending in `-{N}` are ever eligible — `{repo}-{machine}-{N}`, a
+`luv -l` copy `{repo}-{machine}-{N}_2`, and pre-slug `{repo}-{N}` alike.
+Anything else in the workspace root is left alone, and a target that doesn't
+resolve to one is an error rather than an `rm -rf`.
 
 ## Configuration
 

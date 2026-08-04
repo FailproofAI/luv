@@ -63,7 +63,7 @@ the session (which luv does as soon as the clone lands) breaks nothing.
 | `pr_number`, `pr_url` | The session's pull request; `null` until one exists |
 | `pr_state` | `OPEN`, `CLOSED` or `MERGED` — what `luv rm --merged` selects on |
 | `pr_checked` | Unix time GitHub was last asked about it |
-| `pr_hint` | PR number known at dispatch (`-l` / `-pr` only); absent otherwise |
+| `pr_hint` | PR number known at dispatch (`-l` / `-pr` only); absent otherwise. Set even when the folder isn't yet known, which is always the case for `-l` |
 | `adopted` | Present when this machine found the session rather than starting it |
 
 `attached`, `activity`, and `live` are recomputed on every reconcile and are
@@ -230,10 +230,11 @@ case.
 
 Two things bound the damage:
 
-- Only names ending in `-{N}` are eligible — `{repo}-{machine}-{N}` and pre-slug
-  `{repo}-{N}` alike — checked again immediately before the `rm -rf` rather than
-  only at selection time. A stray directory in the workspace root is never a
-  candidate, and a target that resolves to one is an error, not a deletion.
+- Only names ending in `-{N}` are eligible — `{repo}-{machine}-{N}`, a `luv -l`
+  copy `{repo}-{machine}-{N}_2`, and pre-slug `{repo}-{N}` alike — checked again
+  immediately before the `rm -rf` rather than only at selection time. A stray
+  directory in the workspace root is never a candidate, and a target that
+  resolves to one is an error, not a deletion.
 - A named target is its own confirmation, but `--merged` and `--dead` print what
   they matched and ask, because a selector can sweep up folders on a machine you
   are not looking at. `-f` skips the prompt.

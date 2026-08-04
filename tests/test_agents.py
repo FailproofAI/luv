@@ -1,5 +1,6 @@
 import contextlib
 import io
+import json
 import re
 import subprocess
 import tempfile
@@ -169,11 +170,29 @@ class RemoteDispatchTests(unittest.TestCase):
 
         self.assertIn("tmux new-session -A -s luv-myrepo-mbp-42", argv[-1])
 
-    def test_pr_url_derives_session_from_url(self):
+    def test_pr_url_gets_a_pending_session(self):
+        # -l clones a fresh folder on the remote, so its name — and with it the
+        # session name — is not knowable here even when the host answers.
         argv = self._dispatch(["-l", "https://github.com/other/thing/pull/7"],
                               where="thing-box-7")
 
+        self.assertIn("luv-pending-", argv[-1])
+        self.assertIn("_LUV_TMUX_PENDING=", argv[-1])
+
+    def test_pr_url_with_resume_pins_the_existing_folder(self):
+        # -r reopens the newest folder that is already there, so it can attach.
+        argv = self._dispatch(["-l", "https://github.com/other/thing/pull/7", "-r"],
+                              where="thing-box-7")
+
         self.assertIn("-s luv-thing-box-7", argv[-1])
+        self.assertNotIn("_LUV_TMUX_PENDING", argv[-1])
+
+    def test_pr_url_still_records_the_pr_number(self):
+        # The PR link in `luv ls` comes from this hint: a -l session's branch is
+        # the PR's head ref, which no folder name spells out.
+        self._dispatch(["-l", "https://github.com/other/thing/pull/7"])
+
+        self.assertEqual([s.get("pr_hint") for s in luv.load_sessions()], [7])
 
     def test_host_flag_selects_per_host_settings(self):
         argv = self._dispatch(["-s", "gpu", "ml", "train"])
@@ -751,6 +770,55 @@ class NamingTests(unittest.TestCase):
         self.assertEqual(luv.workspace_number("myrepo", "myrepo-42"), 42)
         self.assertIsNone(luv.workspace_number("myrepo", "other-mbp-42"))
 
+    def test_repeat_clones_of_a_pr_get_their_own_folder(self):
+        with self._slug("mbp"):
+            self.assertEqual(luv.next_workspace_dir("myrepo", 42).name,
+                             "myrepo-mbp-42")
+            (self.root / "myrepo-mbp-42").mkdir()
+            self.assertEqual(luv.next_workspace_dir("myrepo", 42).name,
+                             "myrepo-mbp-42_2")
+            (self.root / "myrepo-mbp-42_2").mkdir()
+            self.assertEqual(luv.next_workspace_dir("myrepo", 42).name,
+                             "myrepo-mbp-42_3")
+
+    def test_a_copy_is_still_workspace_42(self):
+        self.assertEqual(luv.workspace_number("myrepo", "myrepo-mbp-42_2"), 42)
+        self.assertEqual(luv.folder_number("myrepo-mbp-42_2"), 42)
+        self.assertEqual(luv.folder_number("myrepo-42_11"), 42)
+        self.assertIsNone(luv.folder_number("myrepo-main_2"))
+
+    def test_copy_suffix_survives_every_derived_name(self):
+        # tmux rejects '.' and ':' in session names and Compose rejects '.' in
+        # project names, which is why the separator is '_'.
+        name = luv.workspace_name("myrepo", 42, slug="mbp", copy=2)
+        self.assertEqual(name, "myrepo-mbp-42_2")
+        self.assertEqual(luv.tmux_session_name(name), "luv-myrepo-mbp-42_2")
+        self.assertEqual(luv.docker_project_name(self.root / name),
+                         "luv-myrepo-mbp-42_2")
+
+    def test_find_workspace_opens_the_newest_copy(self):
+        for name in ("myrepo-mbp-42", "myrepo-mbp-42_2", "myrepo-mbp-42_10"):
+            (self.root / name).mkdir()
+        with self._slug("mbp"):
+            self.assertEqual(luv.find_workspace("myrepo", 42).name,
+                             "myrepo-mbp-42_10")
+
+    def test_copies_of_one_machines_folder_are_not_ambiguous(self):
+        # Two copies made *here* are a -l history, not a naming conflict; only
+        # two different machines leave the number genuinely undecidable.
+        for name in ("myrepo-box-42", "myrepo-box-42_2"):
+            (self.root / name).mkdir()
+        with self._slug("mbp"):
+            self.assertEqual(luv.find_workspace("myrepo", 42).name,
+                             "myrepo-box-42_2")
+
+    def test_find_latest_clone_prefers_the_newest_copy(self):
+        for name in ("myrepo-mbp-41", "myrepo-mbp-41_2"):
+            (self.root / name).mkdir()
+        with self._slug("mbp"):
+            self.assertEqual(luv.find_latest_clone("myrepo").name,
+                             "myrepo-mbp-41_2")
+
     def test_find_workspace_prefers_our_own(self):
         for name in ("myrepo-42", "myrepo-box-42", "myrepo-mbp-42"):
             (self.root / name).mkdir()
@@ -794,6 +862,93 @@ class NamingTests(unittest.TestCase):
             luv.cmd_where(["exo/myrepo", "77"])
 
         self.assertEqual(out.getvalue().split(), ["myrepo-box-42", "myrepo-mbp-77"])
+
+
+class OpenPrTests(unittest.TestCase):
+    """`luv -l` clones the PR again rather than reopening what is lying around."""
+
+    SAME_REPO = json.dumps({
+        "head": {"ref": "feature-branch",
+                 "repo": {"clone_url": "https://github.com/exo/myrepo.git"}},
+        "base": {"repo": {"clone_url": "https://github.com/exo/myrepo.git"}},
+    })
+    FROM_FORK = json.dumps({
+        "head": {"ref": "feature-branch",
+                 "repo": {"clone_url": "https://github.com/someone/myrepo.git"}},
+        "base": {"repo": {"clone_url": "https://github.com/exo/myrepo.git"}},
+    })
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self.root = Path(self.tempdir.name)
+        self.git = []
+        for p in (patch.object(luv, "PRS_DIR", self.root),
+                  patch.object(luv, "machine_slug", return_value="mbp"),
+                  patch.object(luv, "ensure_pr_rules")):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _open(self, pr_json=SAME_REPO, **kwargs):
+        """Run open_pr with git stubbed out; returns the launched folder."""
+        with (patch.object(luv, "run", return_value=_completed(pr_json)),
+              patch.object(luv.subprocess, "run",
+                           side_effect=lambda cmd, **kw: self.git.append(cmd)
+                           or _completed()),
+              patch.object(luv, "launch") as launch,
+              patch.object(luv, "navigate") as navigate,
+              patch.object(luv, "resume") as resume,
+              contextlib.redirect_stdout(io.StringIO()),
+              contextlib.redirect_stderr(io.StringIO())):
+            luv.open_pr("exo", "myrepo", 42, None, **kwargs)
+        called = next(m for m in (launch, navigate, resume) if m.called)
+        return called.call_args.args[0]
+
+    def test_a_fresh_clone_lands_next_to_the_old_folder(self):
+        (self.root / "myrepo-mbp-42").mkdir()
+
+        folder = self._open(fresh=True)
+
+        self.assertEqual(folder.name, "myrepo-mbp-42_2")
+        self.assertIn(["git", "checkout", "feature-branch"], self.git)
+
+    def test_without_fresh_the_existing_folder_is_reused(self):
+        # -pr keeps the old behaviour: it names a workspace, not a URL.
+        (self.root / "myrepo-mbp-42").mkdir()
+
+        self.assertEqual(self._open().name, "myrepo-mbp-42")
+        self.assertEqual(self.git, [], "reopening must not clone")
+
+    def test_resume_reopens_rather_than_recloning(self):
+        # A fresh clone has no conversation in it, so there is nothing to resume.
+        (self.root / "myrepo-mbp-42").mkdir()
+
+        self.assertEqual(self._open(fresh=True, resume_mode=True).name,
+                         "myrepo-mbp-42")
+        self.assertEqual(self.git, [])
+
+    def test_a_fork_pr_also_fetches_the_base_repo(self):
+        self._open(self.FROM_FORK, fresh=True)
+
+        self.assertIn(["git", "remote", "add", "upstream",
+                       "https://github.com/exo/myrepo.git"], self.git)
+        self.assertIn(["git", "fetch", "upstream"], self.git)
+
+    def test_a_same_repo_pr_needs_no_second_remote(self):
+        # The clone already carries every branch; a second remote for the same
+        # URL would just duplicate them.
+        self._open(fresh=True)
+
+        self.assertNotIn("upstream", [a for cmd in self.git for a in cmd])
+
+    def test_a_deleted_fork_fails_before_touching_the_disk(self):
+        gone = json.dumps({"head": {"ref": "feature-branch", "repo": None},
+                           "base": {"repo": {"clone_url": "https://x/y.git"}}})
+
+        with self.assertRaises(SystemExit), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self._open(gone, fresh=True)
+        self.assertEqual(self.git, [])
 
 
 class HandoverTests(unittest.TestCase):
