@@ -1575,5 +1575,450 @@ class SessionTableTests(unittest.TestCase):
         self.assertRegex(lines[2], r"\s-\s+add limits$")
 
 
+
+# Trimmed from a real host running two luv workspaces. Every shape that matters
+# is here: a published port, its IPv6 twin, and a merely-exposed one.
+DOCKER_PS = (
+    "agenteye-legion-511_2|dashboard|0.0.0.0:3000->3000/tcp, [::]:3000->3000/tcp\n"
+    "agenteye-legion-524|clickhouse|9009/tcp, 0.0.0.0:8223->8123/tcp, "
+    "[::]:8223->8123/tcp, 0.0.0.0:9900->9000/tcp, [::]:9900->9000/tcp\n"
+    "unrelated-project|web|0.0.0.0:4000->4000/tcp\n"
+)
+
+# ss fills in users:(...) only for our own processes; the blank rows are root's
+# and other people's, and dropping them is the whole point.
+SS_OUTPUT = (
+    'LISTEN 0 128   127.0.0.1:36891 0.0.0.0:* '
+    'users:(("code-1b6a188127",pid=1175442,fd=12))\n'
+    'LISTEN 0 4096    0.0.0.0:8223  0.0.0.0:*\n'
+    'LISTEN 0 511       [::]:5173     [::]:* users:(("node",pid=48213,fd=21))\n'
+)
+
+
+class PortProbeTests(unittest.TestCase):
+    """What a host reports it is listening on, and who it belongs to."""
+
+    def test_only_published_docker_ports_are_offered(self):
+        with patch.object(luv.shutil, "which", return_value="/bin/docker"), \
+             patch.object(luv, "run", return_value=_completed(DOCKER_PS)):
+            found = luv.docker_listeners({"agenteye-legion-524"})
+
+        # 9009/tcp is exposed to the compose network with nothing on the host to
+        # point a tunnel at, and the [::] rows are the same mapping listed twice.
+        self.assertEqual(found, {8223: ("agenteye-legion-524", "clickhouse"),
+                                 9900: ("agenteye-legion-524", "clickhouse")})
+
+    def test_compose_project_named_after_the_folder_is_ours(self):
+        """An agent running `docker compose up` itself gets the directory name."""
+        with patch.object(luv.shutil, "which", return_value="/bin/docker"), \
+             patch.object(luv, "run", return_value=_completed(DOCKER_PS)):
+            found = luv.docker_listeners({"agenteye-legion-511_2"})
+
+        self.assertEqual(found, {3000: ("agenteye-legion-511_2", "dashboard")})
+
+    def test_compose_project_named_by_luv_is_ours_too(self):
+        ps = "luv-myrepo-box-42|web|0.0.0.0:8080->80/tcp\n"
+        with patch.object(luv.shutil, "which", return_value="/bin/docker"), \
+             patch.object(luv, "run", return_value=_completed(ps)):
+            found = luv.docker_listeners({"myrepo-box-42"})
+
+        self.assertEqual(found, {8080: ("myrepo-box-42", "web")})
+
+    def test_another_projects_containers_are_left_alone(self):
+        with patch.object(luv.shutil, "which", return_value="/bin/docker"), \
+             patch.object(luv, "run", return_value=_completed(DOCKER_PS)):
+            found = luv.docker_listeners({"agenteye-legion-524"})
+
+        self.assertNotIn(4000, found)
+
+    def test_ss_reports_only_processes_we_own(self):
+        self.assertEqual(luv.parse_ss(SS_OUTPUT),
+                         [(36891, 1175442, "code-1b6a188127"),
+                          (5173, 48213, "node")])
+
+    def test_lsof_fallback_groups_files_under_their_process(self):
+        out = "p48213\ncnode\nn127.0.0.1:5173\nn*:5174\np99\ncpostgres\nn*:5432\n"
+
+        self.assertEqual(luv.parse_lsof(out),
+                         [(5173, 48213, "node"), (5174, 48213, "node"),
+                          (5432, 99, "postgres")])
+
+    def test_ancestry_walk_reaches_the_pane_through_the_shell(self):
+        # node <- npm <- bash <- claude <- the pane itself
+        tree = {48213: (48200, "node"), 48200: (47990, "npm"),
+                47990: (47980, "bash"), 47980: (47001, "claude")}
+        roots = {47001: ("abc123", "myrepo-box-42", "luv-myrepo-box-42")}
+
+        self.assertEqual(luv.owning_pane(48213, tree, roots),
+                         ("abc123", "myrepo-box-42", "luv-myrepo-box-42"))
+
+    def test_a_listener_outside_every_pane_belongs_to_nobody(self):
+        tree = {900: (1, "sshd")}
+        roots = {47001: ("abc123", "myrepo-box-42", "luv-myrepo-box-42")}
+
+        self.assertIsNone(luv.owning_pane(900, tree, roots))
+
+    def test_a_pid_cycle_cannot_hang_the_walk(self):
+        tree = {10: (11, "a"), 11: (10, "b")}
+
+        self.assertIsNone(luv.owning_pane(10, tree, {}))
+
+    def _listening(self, panes, ss="", docker=""):
+        def fake_run(cmd, **kwargs):
+            if cmd[:2] == ["tmux", "list-panes"]:
+                return _completed(panes)
+            if cmd[0] == "ss":
+                return _completed(ss)
+            if cmd[0] == "ps":
+                return _completed("48213 47001 node\n47001 1 claude\n")
+            if cmd[0] == "docker":
+                return _completed(docker)
+            return _completed("", 1)
+        out = io.StringIO()
+        with patch.object(luv, "run", side_effect=fake_run), \
+             patch.object(luv.shutil, "which", return_value="/bin/docker"), \
+             patch.object(luv, "load_config", return_value={}), \
+             contextlib.redirect_stdout(out):
+            luv.cmd_listening()
+        return out.getvalue().splitlines()
+
+    def test_docker_wins_over_the_process_walk_for_the_same_port(self):
+        """ss sees a published port as docker-proxy; the service name is better."""
+        lines = self._listening(
+            panes="abc|myrepo-box-42|luv-myrepo-box-42|47001\n",
+            ss='LISTEN 0 4096 0.0.0.0:3000 0.0.0.0:* users:(("node",pid=48213,fd=9))\n',
+            docker="myrepo-box-42|dashboard|0.0.0.0:3000->3000/tcp\n")
+
+        self.assertEqual(lines, ["abc|myrepo-box-42|luv-myrepo-box-42|3000|dashboard"])
+
+    def test_a_pane_that_is_not_luvs_is_ignored(self):
+        lines = self._listening(
+            panes="||my-own-tmux|47001\n",
+            ss='LISTEN 0 4096 0.0.0.0:3000 0.0.0.0:* users:(("node",pid=48213,fd=9))\n')
+
+        self.assertEqual(lines, [])
+
+    def test_privileged_ports_are_left_out(self):
+        lines = self._listening(
+            panes="abc|myrepo-box-42|luv-myrepo-box-42|47001\n",
+            ss='LISTEN 0 4096 0.0.0.0:80 0.0.0.0:* users:(("node",pid=48213,fd=9))\n')
+
+        self.assertEqual(lines, [])
+
+
+class PortForwardTests(unittest.TestCase):
+    """Building tunnels, choosing local ports, and keeping them in step."""
+
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        root = Path(self.tempdir.name)
+        self.patches = [
+            patch.object(luv, "LUV_DIR", root),
+            patch.object(luv, "TUNNEL_DIR", root / "tun"),
+            patch.object(luv, "SESSIONS_FILE", root / "sessions.json"),
+            patch.object(luv, "SESSIONS_LOCK", root / "sessions.lock"),
+            patch.object(luv, "load_config", return_value=REMOTE_CONFIG),
+        ]
+        for p in self.patches:
+            p.start()
+        luv._forward_warned.clear()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        self.tempdir.cleanup()
+
+    HC = {"host": "box", "identity_file": "/keys/box_key"}
+
+    def test_control_command_comes_before_the_host(self):
+        """ssh reads anything after the host as the command to run there."""
+        argv = luv.ssh_base(self.HC, batch=True, control="/tmp/s.sock",
+                            control_op=["-O", "forward", "-L", "1:2:3:4"])
+
+        self.assertEqual(argv[-1], "box")
+        self.assertLess(argv.index("-O"), argv.index("box"))
+        self.assertEqual(argv[argv.index("-O") + 1], "forward")
+
+    def test_master_is_told_to_outlive_this_process(self):
+        argv = luv.ssh_base(self.HC, batch=True, control="/tmp/s.sock", master=True)
+
+        self.assertIn("-M", argv)
+        self.assertIn("-N", argv)
+        self.assertIn("-f", argv)
+        self.assertIn("ControlPersist=yes", argv)
+
+    def test_an_ordinary_call_is_untouched_by_any_of_this(self):
+        """The interactive session must not share the forwarder's connection."""
+        self.assertEqual(luv.ssh_base(self.HC, tty=True),
+                         ["ssh", "-t", "-i", "/keys/box_key", "box"])
+
+    def test_socket_path_does_not_grow_with_the_host_name(self):
+        long_host = {"host": "a-very-long-hostname." * 6}
+
+        # ControlPath has to fit a sockaddr_un: 104 bytes on macOS.
+        self.assertEqual(len(luv.tunnel_socket(long_host).name),
+                         len(luv.tunnel_socket(self.HC).name))
+        self.assertLess(len(luv.tunnel_socket(long_host).name), 24)
+
+    def test_differently_keyed_hosts_get_different_sockets(self):
+        self.assertNotEqual(luv.tunnel_socket(self.HC),
+                            luv.tunnel_socket({"host": "box", "port": 2222}))
+
+    def test_both_ends_of_a_forward_are_loopback(self):
+        cfg = luv.ports_config()
+
+        # 0.0.0.0 on the near end would republish someone's dev server to the
+        # LAN; 127.0.0.1 on the far end is right either way the server bound.
+        self.assertEqual(luv.forward_spec(cfg, 3001, 3000),
+                         "127.0.0.1:3001:127.0.0.1:3000")
+
+    def test_unreachable_host_is_distinguished_from_a_quiet_one(self):
+        with patch.object(luv, "ssh_run",
+                          return_value=_completed("", 255, "ssh: timed out")):
+            self.assertIsNone(luv.query_ports(self.HC))
+
+        with patch.object(luv, "ssh_run", return_value=_completed("")):
+            self.assertEqual(luv.query_ports(self.HC), [])
+
+    def test_a_host_running_an_older_luv_reports_no_ports(self):
+        stale = _completed("", 1, "luv: error: repo not found")
+
+        with patch.object(luv, "ssh_run", return_value=stale):
+            self.assertEqual(luv.query_ports(self.HC), [])
+
+    def test_local_port_mirrors_the_remote_one_when_it_is_free(self):
+        with patch.object(luv, "port_free", return_value=True):
+            self.assertEqual(luv.pick_local_port(3000, set(), "127.0.0.1"), 3000)
+
+    def test_local_port_walks_up_past_a_collision(self):
+        with patch.object(luv, "port_free", side_effect=lambda p, b: p != 3000):
+            self.assertEqual(luv.pick_local_port(3000, set(), "127.0.0.1"), 3001)
+
+        with patch.object(luv, "port_free", return_value=True):
+            self.assertEqual(luv.pick_local_port(3000, {3000}, "127.0.0.1"), 3001)
+
+    def test_a_mapping_already_in_use_is_kept(self):
+        """A URL that worked a minute ago should still work."""
+        entry = {"workspace": "w",
+                 "forwards": [{"remote": 3000, "local": 3007, "label": "web"}]}
+        rows = [{"id": "", "workspace": "w", "session": "s", "port": 3000,
+                 "label": "web"}]
+
+        with patch.object(luv, "port_free", return_value=True):
+            want = luv.desired_forwards(entry, rows, luv.ports_config(), set(),
+                                        {3007: 3000})
+
+        self.assertEqual(want, [{"remote": 3000, "local": 3007, "label": "web"}])
+
+    def test_a_mapping_someone_else_took_is_reallocated(self):
+        entry = {"workspace": "w",
+                 "forwards": [{"remote": 3000, "local": 3007, "label": "web"}]}
+        rows = [{"id": "", "workspace": "w", "session": "s", "port": 3000,
+                 "label": "web"}]
+
+        with patch.object(luv, "port_free", return_value=True):
+            want = luv.desired_forwards(entry, rows, luv.ports_config(), {3007}, {})
+
+        self.assertEqual(want[0]["local"], 3000)
+
+    def _sync(self, sessions, detected, established=None, **kwargs):
+        """Run a sync with the ssh work stubbed, returning what it asked for."""
+        calls = []
+        with patch.object(luv, "tunnel_up", return_value=True), \
+             patch.object(luv, "port_free", return_value=True), \
+             patch.object(luv, "load_tunnel_state", return_value=dict(established or {})), \
+             patch.object(luv, "save_tunnel_state") as saved, \
+             patch.object(luv, "tunnel_down") as down, \
+             patch.object(luv, "forward_change",
+                          side_effect=lambda hc, cfg, op, l, r: calls.append((op, l, r)) or True):
+            fresh = luv.sync_forwards(sessions, detected, **kwargs)
+        return calls, fresh, saved, down
+
+    def _session(self, **kw):
+        base = {"id": "s1", "host": "box", "workspace": "myrepo-box-42"}
+        base.update(kw)
+        return base
+
+    @staticmethod
+    def _row(port, label="web", workspace="myrepo-box-42"):
+        return {"id": "", "workspace": workspace, "session": "luv-myrepo-box-42",
+                "port": port, "label": label}
+
+    def test_a_session_is_not_forwarded_until_it_is_asked_for(self):
+        """A busy host carries dozens; they do not all get local ports uninvited."""
+        calls, fresh, _, _ = self._sync([self._session()],
+                                        {"box": [self._row(3000)]})
+
+        self.assertEqual(calls, [])
+        self.assertEqual(fresh, [])
+
+    def test_naming_a_session_forwards_it(self):
+        calls, fresh, saved, _ = self._sync(
+            [self._session()], {"box": [self._row(3000)]},
+            opt_in=lambda s: True)
+
+        self.assertEqual(calls, [("forward", 3000, 3000)])
+        self.assertEqual(fresh[0][1], [{"remote": 3000, "local": 3000, "label": "web"}])
+        saved.assert_called_once()
+
+    def test_a_session_that_holds_forwards_keeps_being_maintained(self):
+        """This is what lets a forward outlive detaching."""
+        session = self._session(
+            forwards=[{"remote": 3000, "local": 3000, "label": "web"}])
+
+        calls, _, _, _ = self._sync([session],
+                                    {"box": [self._row(3000), self._row(5173, "vite")]},
+                                    established={3000: 3000})
+
+        self.assertEqual(calls, [("forward", 5173, 5173)])
+
+    def test_a_server_that_stopped_has_its_forward_cancelled(self):
+        session = self._session(forwards=[
+            {"remote": 3000, "local": 3000, "label": "web"},
+            {"remote": 5173, "local": 5173, "label": "vite"}])
+
+        calls, _, _, _ = self._sync([session], {"box": [self._row(3000)]},
+                                    established={3000: 3000, 5173: 5173})
+
+        self.assertEqual(calls, [("cancel", 5173, 5173)])
+
+    def test_an_unreachable_host_keeps_every_forward_it_has(self):
+        """Merely losing the network must not read as 'the servers all stopped'."""
+        session = self._session(
+            forwards=[{"remote": 3000, "local": 3000, "label": "web"}])
+
+        calls, fresh, saved, down = self._sync([session], {"box": None},
+                                               established={3000: 3000})
+
+        self.assertEqual(calls, [])
+        self.assertEqual(fresh, [])
+        down.assert_not_called()
+        self.assertEqual(session["forwards"],
+                         [{"remote": 3000, "local": 3000, "label": "web"}])
+
+    def test_two_sessions_wanting_the_same_port_do_not_collide(self):
+        a = self._session(id="s1", workspace="a-box-1")
+        b = self._session(id="s2", workspace="b-box-2")
+        detected = {"box": [self._row(3000, workspace="a-box-1"),
+                            self._row(3000, workspace="b-box-2")]}
+
+        calls, _, _, _ = self._sync([a, b], detected, opt_in=lambda s: True)
+
+        self.assertEqual(sorted(calls), [("forward", 3000, 3000),
+                                         ("forward", 3001, 3000)])
+        self.assertNotEqual(a["forwards"][0]["local"], b["forwards"][0]["local"])
+
+    def test_dropping_the_last_forward_closes_the_connection(self):
+        session = self._session(
+            forwards=[{"remote": 3000, "local": 3000, "label": "web"}])
+
+        calls, _, saved, down = self._sync([session], {"box": []},
+                                           established={3000: 3000})
+
+        self.assertEqual(calls, [("cancel", 3000, 3000)])
+        down.assert_called_once()
+        saved.assert_not_called()
+
+    def test_a_master_outliving_its_last_session_is_closed(self):
+        """Otherwise it lingers until the machine reboots, holding dead forwards."""
+        calls, _, saved, down = self._sync([], {"box": []},
+                                           established={3000: 3000})
+
+        self.assertEqual(calls, [("cancel", 3000, 3000)])
+        down.assert_called_once()
+
+    def test_an_unreachable_host_keeps_its_master(self):
+        calls, _, _, down = self._sync([], {"box": None},
+                                       established={3000: 3000})
+
+        self.assertEqual(calls, [])
+        down.assert_not_called()
+
+    def test_a_local_session_is_never_tunnelled(self):
+        """The servers are already on this machine."""
+        calls, fresh, _, _ = self._sync(
+            [self._session(host=None)],
+            {"": [self._row(3000)]}, opt_in=lambda s: True)
+
+        self.assertEqual(calls, [])
+        self.assertEqual(fresh, [])
+
+    def test_a_refused_forward_is_reported_once_per_host(self):
+        refused = _completed("", 255, "channel setup failed: administratively prohibited")
+        cfg = luv.ports_config()
+        err = io.StringIO()
+
+        with patch.object(luv, "tunnel_ctl", return_value=refused), \
+             contextlib.redirect_stderr(err):
+            self.assertFalse(luv.forward_change(self.HC, cfg, "forward", 1, 2))
+            self.assertFalse(luv.forward_change(self.HC, cfg, "forward", 3, 4))
+
+        self.assertEqual(err.getvalue().count("AllowTcpForwarding"), 1)
+
+    def test_the_watcher_never_writes_to_the_terminal(self):
+        """It runs under a full-screen agent UI; stdout there is somebody's redraw."""
+        out, err = io.StringIO(), io.StringIO()
+
+        with patch.object(luv, "ports_config", return_value=dict(luv.PORT_DEFAULTS)), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            luv.start_port_watcher(lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+            time.sleep(0.05)
+
+        self.assertEqual(out.getvalue(), "")
+        self.assertEqual(err.getvalue(), "")
+
+    def test_announcing_uses_tmux_rather_than_the_terminal(self):
+        sent = []
+        forwards = [{"remote": 3000, "local": 3001, "label": "dashboard"}]
+
+        with patch.object(luv, "run", side_effect=lambda argv, **kw: sent.append(argv) or _completed()):
+            luv.announce_forwards(self.HC, "luv-myrepo-box-42", forwards, forwards)
+
+        joined = " ".join(" ".join(argv) for argv in sent)
+        self.assertIn("set-option", joined)
+        self.assertIn("@luv_ports", joined)
+        self.assertIn("display-message", joined)
+        self.assertIn("localhost:3001", joined)
+
+    def test_nothing_new_means_nothing_to_announce(self):
+        sent = []
+        forwards = [{"remote": 3000, "local": 3001, "label": "dashboard"}]
+
+        with patch.object(luv, "run", side_effect=lambda argv, **kw: sent.append(argv) or _completed()):
+            luv.announce_forwards(self.HC, "luv-myrepo-box-42", forwards, [])
+
+        joined = " ".join(" ".join(argv) for argv in sent)
+        self.assertNotIn("display-message", joined)
+
+    def test_the_ports_column_stays_short(self):
+        session = {"ports": [3000, 5173, 6379, 8080, 8123, 9000]}
+
+        self.assertEqual(luv.ports_cell(session), "3000,5173,6379,8080,+2")
+        self.assertEqual(luv.ports_cell({}), "-")
+
+    def test_ls_columns_still_line_up_with_ports_in_them(self):
+        rows = [{"host": "box", "session": "luv-a", "workspace": "a-box-1",
+                 "agent": "claude", "attached": True, "live": True,
+                 "ports": [3000], "prompt": "fix it"},
+                {"host": "box", "session": "luv-longer-name", "workspace": "b-box-2",
+                 "agent": "codex", "attached": False, "live": True,
+                 "prompt": "add limits"}]
+        out = io.StringIO()
+
+        with patch.object(luv.sys.stdout, "isatty", return_value=False), \
+             contextlib.redirect_stdout(out):
+            luv.print_sessions(rows)
+        lines = out.getvalue().splitlines()
+
+        header = lines[0]
+        self.assertIn("PORTS", header)
+        self.assertLess(header.index("PR "), header.index("PORTS"))
+        self.assertLess(header.index("PORTS"), header.index("PROMPT"))
+        for line in lines[1:]:
+            self.assertEqual(line.index("fix it") if "fix it" in line
+                             else line.index("add limits"),
+                             header.index("PROMPT"))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -109,6 +109,30 @@ or `ssh_opts` may be set here and takes precedence over the `remote.*` value of
 the same name. This is what makes `-s otherbox` usable: without it, one global
 key would be wrong for every host but the default.
 
+### `ports`
+
+*object.* Port forwarding. Servers an agent starts on a remote host are
+detected and tunnelled to this machine — see
+[remote-sessions.md](remote-sessions.md#reaching-servers-the-agent-started).
+Every key is optional:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `auto` | `true` | Forward the session you are attached to, as servers come and go. `false` leaves everything to `luv ports`. |
+| `interval` | `10` | Seconds between re-checks while attached. Minimum 2. |
+| `bind` | `"127.0.0.1"` | Local address the forwards listen on. `"0.0.0.0"` would publish the agent's dev server to your whole network. |
+| `min` | `1024` | Ports below this are ignored; a dev server is not on 80. |
+| `ignore` | `[]` | Specific ports never to forward. |
+| `max_per_session` | `12` | Cap on forwards per session, so one stack cannot eat the local port space. |
+
+```bash
+luv config set ports.interval 5
+luv config set ports.ignore '[5432, 6379]'
+luv config set ports.auto false
+```
+
+Unlike `remote.*`, these are global — there is no `remote.hosts.<name>.ports`.
+
 ## Resolution order
 
 **Host:** `-s HOST` → `remote.host`. If neither, luv runs locally.
