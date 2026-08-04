@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import json
 import os
 import random
@@ -10,6 +11,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -22,6 +24,8 @@ LUV_DIR = Path.home() / ".luv"
 CONFIG_FILE = LUV_DIR / "config.json"
 SESSIONS_FILE = LUV_DIR / "sessions.json"
 SESSIONS_LOCK = LUV_DIR / "sessions.lock"
+TUNNEL_DIR = LUV_DIR / "tun"
+PORTS_LOG = LUV_DIR / "ports.log"
 CLAUDE_JSON = Path.home() / ".claude.json"
 CLAUDE_SETTINGS_JSON = Path.home() / ".claude" / "settings.json"
 CODEX_AGENTS_MD = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "AGENTS.md"
@@ -149,15 +153,33 @@ def resolve_host(explicit: str | None = None,
     return hc
 
 
-def ssh_base(hc: dict, *, tty: bool = False, batch: bool = False) -> list[str]:
+def ssh_base(hc: dict, *, tty: bool = False, batch: bool = False,
+             control: str | None = None, master: bool = False,
+             control_op: list[str] | None = None) -> list[str]:
     """Build the ssh argv prefix for a host. Every SSH call site goes through
     here — an identity file that applied to some commands but not others would
-    be worse than none at all."""
+    be worse than none at all.
+
+    `control` points at a multiplexing socket, which is how the port forwarder
+    adds and drops tunnels on a connection that is already up. It is only ever
+    passed by the forwarder: sharing one connection with the interactive session
+    would mean a dying tunnel could take an agent's terminal down with it.
+    """
     cmd = ["ssh"]
     if tty:
         cmd.append("-t")
     if batch:
         cmd += ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
+    if control:
+        cmd += ["-S", str(control)]
+        if master:
+            # ControlPersist=yes rather than a timeout: forwards are meant to
+            # outlive detaching, and an idle connection is what that looks like.
+            cmd += ["-M", "-N", "-f", "-o", "ControlPersist=yes",
+                    "-o", "ExitOnForwardFailure=no"]
+        # Control commands (-O check/forward/cancel/exit) have to precede the
+        # host, or ssh reads them as the command to run on the far end.
+        cmd += [str(o) for o in (control_op or [])]
     if hc.get("identity_file"):
         # ssh does not expand ~ itself when argv arrives via execv, not a shell.
         cmd += ["-i", str(Path(str(hc["identity_file"])).expanduser())]
@@ -1563,7 +1585,7 @@ def terminal_guard():
                 os.write(fd, TERM_RESET.encode())
 
 
-def hand_over(argv: list[str], *, restore: bool = True) -> None:
+def hand_over(argv: list[str], *, restore: bool = True, watch=None) -> None:
     """Give the terminal to a child and exit with its status. Never returns.
 
     Without `restore` this is a plain execv, which is the better deal when
@@ -1576,12 +1598,20 @@ def hand_over(argv: list[str], *, restore: bool = True) -> None:
     turn mouse tracking back off. The child is still in our foreground process
     group, so it keeps receiving Ctrl-C and SIGWINCH from the terminal driver
     exactly as it did under execv.
+
+    `watch` gets to piggyback on that parent: it is the only process alive for
+    the whole session, which is what the port forwarder needs to notice a server
+    the agent starts ten minutes in. It runs on a daemon thread and touches
+    neither the terminal nor termios — this path is the one that has to stay
+    boring.
     """
     if not restore:
         os.execv(argv[0], argv)
     else:
         with terminal_guard():
             proc = subprocess.Popen(argv)
+            if watch is not None:
+                start_port_watcher(watch)
             while True:
                 try:
                     code = proc.wait()
@@ -1593,13 +1623,13 @@ def hand_over(argv: list[str], *, restore: bool = True) -> None:
         sys.exit(code)
 
 
-def exec_ssh(hc: dict, remote_cmd: str, *, tty: bool = True) -> None:
+def exec_ssh(hc: dict, remote_cmd: str, *, tty: bool = True, watch=None) -> None:
     """Hand the terminal to ssh. Never returns."""
     ssh_bin = shutil.which("ssh")
     if not ssh_bin:
         die("'ssh' not found in PATH")
     argv = ssh_base(hc, tty=tty) + [remote_shell(remote_cmd)]
-    hand_over([ssh_bin] + argv[1:], restore=tty)
+    hand_over([ssh_bin] + argv[1:], restore=tty, watch=watch)
 
 
 def attach_session(hc: dict | None, name: str) -> None:
@@ -1615,7 +1645,8 @@ def attach_session(hc: dict | None, name: str) -> None:
         hand_over([tmux_bin, "attach", "-d", "-t", name])
         return
     print(f"luv: attaching {name} on {hc['host']}")
-    exec_ssh(hc, shlex.join(["tmux", "attach", "-d", "-t", name]))
+    exec_ssh(hc, shlex.join(["tmux", "attach", "-d", "-t", name]),
+             watch=port_watch(hc, session=name))
 
 
 def remote_prompt(args: list[str]) -> str | None:
@@ -1734,7 +1765,7 @@ def dispatch_remote(hc: dict, remote_args: list[str], *, workspace: str | None =
             die(f"could not start {session} on {hc['host']}: {r.stderr.strip()}")
         print(f"luv: started detached — 'luv continue' to attach")
         return
-    exec_ssh(hc, cmd, tty=tty)
+    exec_ssh(hc, cmd, tty=tty, watch=port_watch(hc, sid=sid, session=session))
 
 
 def cmd_paths() -> None:
@@ -1745,6 +1776,236 @@ def cmd_paths() -> None:
     """
     print(Path.home())
     print(PRS_DIR)
+
+
+# ---------------------------------------------------------------------------
+# Port detection, host side.
+#
+# Two sources, because neither sees the whole picture. A server the agent
+# started itself is a descendant of its tmux pane, so walking parent pids
+# attributes it. A Compose-published port is held by docker-proxy, whose parent
+# is dockerd — no walk reaches a pane from there, so the Compose project label
+# has to answer instead. On a real box the second case is the common one.
+# ---------------------------------------------------------------------------
+
+PROBE_TIMEOUT = 5     # a wedged docker ps must never hang the machine asking
+ANCESTRY_MAX = 32     # a pid chain longer than this is a cycle, not a tree
+
+PORT_DEFAULTS = {"auto": True, "interval": 10, "bind": "127.0.0.1",
+                 "min": 1024, "ignore": (), "max_per_session": 12}
+
+
+def ports_config() -> dict:
+    """The ports.* config block with defaults filled in."""
+    cfg = dict(PORT_DEFAULTS)
+    configured = load_config().get("ports")
+    if isinstance(configured, dict):
+        for key in PORT_DEFAULTS:
+            if configured.get(key) is not None:
+                cfg[key] = configured[key]
+    ignore = cfg["ignore"]
+    cfg["ignore"] = {int(p) for p in ignore if str(p).isdigit()} \
+        if isinstance(ignore, (list, tuple, set)) else set()
+    return cfg
+
+
+def pane_roots() -> dict[int, tuple[str, str, str]]:
+    """pane pid -> (@luv_id, @luv_workspace, session name) per luv session here.
+
+    Panes without an @luv_workspace are the user's own tmux sessions and are
+    left out: forwarding whatever those happen to be listening on is not
+    something anybody asked for.
+
+    The session name rides along because the machine holding the ports is the
+    only one that knows it for certain — a session dispatched a moment ago is
+    still called luv-pending-<id> in the registry and gets renamed on arrival.
+    """
+    r = run(["tmux", "list-panes", "-a", "-F",
+             "#{@luv_id}|#{@luv_workspace}|#{session_name}|#{pane_pid}"],
+            timeout=PROBE_TIMEOUT)
+    roots: dict[int, tuple[str, str, str]] = {}
+    if r.returncode != 0:
+        return roots
+    for line in r.stdout.splitlines():
+        parts = line.split("|")
+        if len(parts) == 4 and parts[1] and parts[3].isdigit():
+            roots[int(parts[3])] = (parts[0], parts[1], parts[2])
+    return roots
+
+
+def process_tree() -> dict[int, tuple[int, str]]:
+    """pid -> (ppid, command name) for every process we can see.
+
+    ps rather than /proc so a macOS host works from the same code, and the
+    command name comes along for free — it is the label for whatever a listener
+    turns out to be.
+    """
+    r = run(["ps", "-eo", "pid=,ppid=,comm="], timeout=PROBE_TIMEOUT)
+    tree: dict[int, tuple[int, str]] = {}
+    for line in r.stdout.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+            tree[int(parts[0])] = (int(parts[1]), parts[2].strip())
+    return tree
+
+
+def owning_pane(pid: int, tree: dict[int, tuple[int, str]],
+                roots: dict[int, tuple[str, str, str]]) -> tuple[str, str, str] | None:
+    """Walk a listener's ancestry to the luv pane that owns it, or None.
+
+    'node' is four or five hops below the pane — npm, a shell, the agent — and
+    only the top of that chain identifies a session.
+    """
+    for _ in range(ANCESTRY_MAX):
+        if pid in roots:
+            return roots[pid]
+        parent = tree.get(pid)
+        if parent is None or parent[0] <= 1:
+            return None
+        pid = parent[0]
+    return None
+
+
+SS_LISTENER_RE = re.compile(r'users:\(\("([^"]+)",pid=(\d+)')
+
+
+def parse_ss(output: str) -> list[tuple[int, int, str]]:
+    """(port, pid, command) from `ss -ltnp` output.
+
+    ss fills in users:(...) only for our own processes, which is exactly the
+    filter wanted: root's services and other people's drop out without needing
+    privileges to look at them in the first place.
+    """
+    found = []
+    for line in output.splitlines():
+        m = SS_LISTENER_RE.search(line)
+        if not m:
+            continue
+        fields = line.split()
+        if len(fields) < 4:
+            continue
+        port = fields[3].rsplit(":", 1)[-1]
+        if port.isdigit():
+            found.append((int(port), int(m.group(2)), m.group(1)))
+    return found
+
+
+def parse_lsof(output: str) -> list[tuple[int, int, str]]:
+    """(port, pid, command) from `lsof -F pcn` output — the macOS fallback.
+
+    One field per line, tagged by its first character, grouped process-then-files.
+    """
+    found, pid, comm = [], None, ""
+    for line in output.splitlines():
+        tag, value = line[:1], line[1:]
+        if tag == "p" and value.isdigit():
+            pid, comm = int(value), ""
+        elif tag == "c":
+            comm = value
+        elif tag == "n" and pid is not None:
+            port = value.rsplit(":", 1)[-1]
+            if port.isdigit():
+                found.append((int(port), pid, comm))
+    return found
+
+
+def host_listeners() -> list[tuple[int, int, str]]:
+    """Every listening TCP socket owned by a process of ours."""
+    r = run(["ss", "-ltnpH"], timeout=PROBE_TIMEOUT)
+    if r.returncode == 0:
+        return parse_ss(r.stdout)
+    # -H is newer than ss itself; an older build prints a header rather than
+    # accepting the flag, and search-per-line skips it without extra work.
+    r = run(["ss", "-ltnp"], timeout=PROBE_TIMEOUT)
+    if r.returncode == 0:
+        return parse_ss(r.stdout)
+    r = run(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pcn"],
+            timeout=PROBE_TIMEOUT)
+    return parse_lsof(r.stdout) if r.returncode == 0 else []
+
+
+DOCKER_PS_FMT = ('{{.Label "com.docker.compose.project"}}|'
+                 '{{.Label "com.docker.compose.service"}}|{{.Ports}}')
+# Only a published port has a '->'; a bare '9009/tcp' is exposed to the compose
+# network and has nothing on the host to point a tunnel at.
+PUBLISHED_RE = re.compile(r":(\d+)->\d+/tcp")
+
+
+def compose_normalize(name: str) -> str:
+    """How Compose rewrites a project name it was handed."""
+    return re.sub(r"[^a-z0-9_-]", "", name.lower())
+
+
+def compose_aliases(workspace: str) -> set[str]:
+    """Every Compose project name that could mean this workspace.
+
+    luv's own start_docker passes -p luv-<workspace>, but an agent that runs
+    `docker compose up` itself gets a project named after the directory it is
+    standing in — which is the workspace folder. Both are luv's work, and in
+    practice the second is the one that turns up.
+    """
+    names = {workspace, f"luv-{workspace}"}
+    return names | {compose_normalize(n) for n in names}
+
+
+def docker_listeners(workspaces: set[str]) -> dict[int, tuple[str, str]]:
+    """host port -> (workspace, compose service) for luv's Compose stacks."""
+    if not workspaces or not shutil.which("docker"):
+        return {}
+    r = run(["docker", "ps", "--format", DOCKER_PS_FMT], timeout=PROBE_TIMEOUT)
+    if r.returncode != 0:
+        return {}
+    owner = {}
+    for ws in sorted(workspaces):
+        for alias in compose_aliases(ws):
+            owner.setdefault(alias, ws)
+    found: dict[int, tuple[str, str]] = {}
+    for line in r.stdout.splitlines():
+        project, _, rest = line.partition("|")
+        service, _, ports = rest.partition("|")
+        ws = owner.get(project.strip())
+        if not ws:
+            continue
+        # The same mapping is listed once for IPv4 and again for IPv6; keying by
+        # host port collapses the pair.
+        for port in PUBLISHED_RE.findall(ports):
+            found[int(port)] = (ws, service.strip() or "docker")
+    return found
+
+
+def cmd_listening() -> None:
+    """Print '<luv_id>|<workspace>|<session>|<port>|<label>' for every port a luv
+    session on this machine is listening on.
+
+    For the dispatcher rather than for people, like --where and --paths: only
+    the machine running the servers can see them, and only it can say which tmux
+    pane each one hangs off.
+    """
+    roots = pane_roots()
+    if not roots:
+        return
+    workspaces = {ws for _, ws, _ in roots.values()}
+    owners = {ws: (luv_id, session) for luv_id, ws, session in roots.values()}
+
+    found: dict[int, tuple[str, str]] = {}
+    tree = process_tree()
+    for port, pid, comm in host_listeners():
+        owner = owning_pane(pid, tree, roots)
+        if owner:
+            found.setdefault(port, (owner[1], comm))
+
+    # Docker last, and overriding: ss shows a published port as docker-proxy,
+    # which the ancestry walk either missed or attributed to nothing useful. The
+    # Compose service name is the better answer for a person reading it, too.
+    found.update(docker_listeners(workspaces))
+
+    cfg = ports_config()
+    for port in sorted(found):
+        if port < cfg["min"] or port in cfg["ignore"]:
+            continue
+        workspace, label = found[port]
+        luv_id, session = owners.get(workspace, ("", ""))
+        print(f"{luv_id}|{workspace}|{session}|{port}|{label}")
 
 
 def host_label(hc: dict | None) -> str:
@@ -1772,6 +2033,410 @@ def remote_paths(hc: dict | None) -> tuple[Path, Path]:
         die(f"could not read paths from {hc['host']}: "
             f"{r.stderr.strip() or 'no answer'}")
     return Path(lines[-2]), Path(lines[-1])
+
+
+# ---------------------------------------------------------------------------
+# Port forwarding, this machine's side.
+#
+# One multiplexed ssh connection per host, kept apart from every other call
+# site. Forwards can then be added and dropped on a connection that is already
+# up — which is the whole trick, because a server the agent starts ten minutes
+# in cannot be named on the command line that opened the session.
+# ---------------------------------------------------------------------------
+
+FORWARD_TIMEOUT = 10
+_forward_warned: set[str] = set()
+
+
+def query_ports(hc: dict | None) -> list[dict] | None:
+    """What luv sessions on a host are listening on. None if it never answered.
+
+    Mirrors query_tmux, the None included: a host that is merely unreachable
+    must not read as a host whose servers all stopped, or the next sync would
+    tear down every forward it has.
+
+    A host running a luv too old to know --listening fails its own argument
+    parse and prints nothing, which arrives here as "no ports" — the way
+    --where already degrades.
+    """
+    r = ssh_run(hc, luv_command(hc, ["--listening"]))
+    if hc is not None and r.returncode == 255:
+        return None
+    rows = []
+    for line in r.stdout.strip().splitlines():
+        parts = line.split("|")
+        if len(parts) == 5 and parts[3].isdigit():
+            rows.append({"id": parts[0], "workspace": parts[1], "session": parts[2],
+                         "port": int(parts[3]), "label": parts[4]})
+    return rows
+
+
+def tunnel_socket(hc: dict) -> Path:
+    """Control socket for this host's forwarding connection.
+
+    Hashed rather than named after the host for two reasons: ControlPath has to
+    fit a sockaddr_un (104 bytes on macOS, and a long host name plus a long home
+    directory gets there), and the same host reached with a different key or
+    port is a different connection.
+    """
+    ident = "|".join(str(hc.get(k) or "")
+                     for k in ("host", "port", "identity_file"))
+    return TUNNEL_DIR / f"{hashlib.sha256(ident.encode()).hexdigest()[:12]}.sock"
+
+
+def tunnel_state_path(hc: dict) -> Path:
+    return tunnel_socket(hc).with_suffix(".json")
+
+
+def load_tunnel_state(hc: dict) -> dict[int, int]:
+    """local port -> remote port for what this master is believed to carry.
+
+    Kept beside the socket rather than derived: ssh can be asked whether a
+    master is alive but not what it is forwarding, and re-adding a forward that
+    already exists fails noisily.
+    """
+    try:
+        data = json.loads(tunnel_state_path(hc).read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+    pairs = data.get("forwards") if isinstance(data, dict) else None
+    state = {}
+    for pair in pairs if isinstance(pairs, list) else []:
+        if isinstance(pair, list) and len(pair) == 2 and \
+                all(isinstance(p, int) for p in pair):
+            state[pair[0]] = pair[1]
+    return state
+
+
+def save_tunnel_state(hc: dict, forwards: dict[int, int]) -> None:
+    TUNNEL_DIR.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        tunnel_state_path(hc).write_text(json.dumps(
+            {"host": hc["host"], "forwards": sorted(forwards.items())}) + "\n")
+
+
+def tunnel_ctl(hc: dict, op: list[str],
+               timeout: float = FORWARD_TIMEOUT) -> subprocess.CompletedProcess:
+    """Run an ssh control command against this host's forwarding master."""
+    return run(ssh_base(hc, batch=True, control=str(tunnel_socket(hc)),
+                        control_op=op), timeout=timeout)
+
+
+def tunnel_alive(hc: dict) -> bool:
+    return tunnel_ctl(hc, ["-O", "check"], timeout=5).returncode == 0
+
+
+def tunnel_up(hc: dict) -> bool:
+    """Ensure the forwarding master is connected. False when it will not come up."""
+    if tunnel_alive(hc):
+        return True
+    TUNNEL_DIR.mkdir(parents=True, exist_ok=True)
+    # -f backgrounds ssh once the connection is made, so this returns quickly
+    # and the check below is what actually confirms it.
+    run(ssh_base(hc, batch=True, control=str(tunnel_socket(hc)), master=True),
+        timeout=20)
+    return tunnel_alive(hc)
+
+
+def tunnel_down(hc: dict) -> None:
+    """Drop the master and every forward it carries."""
+    tunnel_ctl(hc, ["-O", "exit"], timeout=5)
+    with contextlib.suppress(OSError):
+        tunnel_state_path(hc).unlink()
+
+
+def forward_spec(cfg: dict, local: int, remote: int) -> str:
+    """The -L argument for one forward.
+
+    The far end is always loopback *on the host*, which is right whether the
+    server bound 127.0.0.1 or 0.0.0.0. The near end defaults to loopback too:
+    binding 0.0.0.0 would republish someone's dev server onto the LAN.
+    """
+    return f"{cfg['bind']}:{local}:127.0.0.1:{remote}"
+
+
+def forward_change(hc: dict, cfg: dict, op: str, local: int, remote: int) -> bool:
+    """Add or cancel one forward on the live master."""
+    r = tunnel_ctl(hc, ["-O", op, "-L", forward_spec(cfg, local, remote)])
+    if r.returncode != 0 and op == "forward":
+        host = hc["host"]
+        if "administratively prohibited" in r.stderr.lower() \
+                and host not in _forward_warned:
+            _forward_warned.add(host)
+            print(f"luv: warning: {host} refuses port forwarding "
+                  "(sshd AllowTcpForwarding is off)", file=sys.stderr)
+        return False
+    return True
+
+
+def port_free(port: int, bind: str) -> bool:
+    """Whether we could listen on this port right now."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind((bind, port))
+            return True
+        except OSError:
+            return False
+
+
+def pick_local_port(remote: int, taken: set[int], bind: str) -> int | None:
+    """A free local port for a remote one, its own number where possible.
+
+    Mirroring is what makes this pleasant: the URL the agent prints in its own
+    logs is then the URL that works here. The walk upward covers the second
+    session that also wants :3000, and the ephemeral fallback the case where a
+    whole block is spoken for.
+    """
+    for candidate in range(remote, min(remote + 51, 65536)):
+        if candidate not in taken and port_free(candidate, bind):
+            return candidate
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        try:
+            s.bind((bind, 0))
+            return s.getsockname()[1]
+        except OSError:
+            return None
+
+
+def session_ports(entry: dict, rows: list[dict]) -> list[dict]:
+    """Detected listeners belonging to one session, lowest port first."""
+    ws, sid = entry.get("workspace"), entry.get("id")
+    mine = {}
+    for row in rows:
+        if (ws and row["workspace"] == ws) or (sid and row["id"] and row["id"] == sid):
+            mine.setdefault(row["port"], row)
+    return [mine[p] for p in sorted(mine)]
+
+
+def desired_forwards(entry: dict, rows: list[dict], cfg: dict,
+                     taken: set[int], established: dict[int, int]) -> list[dict]:
+    """The forward list this session should have.
+
+    A local port already in use for this same remote port is kept rather than
+    reallocated — a URL that worked a minute ago should still work. `established`
+    is what says a busy local port is busy because *we* are already forwarding
+    it, which no bind test can distinguish.
+    """
+    prior = {f["remote"]: f["local"] for f in entry.get("forwards") or []
+             if isinstance(f, dict)
+             and isinstance(f.get("remote"), int) and isinstance(f.get("local"), int)}
+    out = []
+    for row in session_ports(entry, rows):
+        if len(out) >= cfg["max_per_session"]:
+            break
+        remote = row["port"]
+        local = prior.get(remote)
+        reusable = (local is not None and local not in taken
+                    and (established.get(local) == remote or port_free(local, cfg["bind"])))
+        if not reusable:
+            local = pick_local_port(remote, taken, cfg["bind"])
+        if local is None:
+            continue
+        taken.add(local)
+        out.append({"remote": remote, "local": local, "label": row["label"]})
+    return out
+
+
+def sync_forwards(sessions: list[dict], detected: dict[str, list[dict] | None],
+                  identity: str | None = None,
+                  opt_in=lambda s: False) -> list[tuple[dict, list[dict]]]:
+    """Bring every host's forwards in line with what its sessions are listening on.
+
+    Mutates each session's "forwards" in place and returns (session, new
+    forwards) for whatever appeared this pass, so a caller can announce it.
+
+    `opt_in` decides whether a session that holds no forwards yet should get
+    them. Sessions that already have some always keep being maintained, which is
+    what lets a forward outlive detaching. Everything else needs asking for: a
+    busy box carries dozens of sessions and they should not all get a piece of
+    this machine's port space uninvited.
+    """
+    cfg = ports_config()
+    # Probed hosts join the set even with no sessions on them: that is how a
+    # master outlives the last session it was carrying forwards for, and it must
+    # be told to go away rather than lingering until the machine reboots.
+    hosts = {s.get("host") or "" for s in sessions if s.get("host")}
+    hosts |= {h for h in detected if h and detected[h] is not None}
+    hcs = {h: resolve_host(h, identity) for h in hosts}
+    established = {h: load_tunnel_state(hc) for h, hc in hcs.items() if hc}
+
+    taken: set[int] = set()
+    want_by_host: dict[str, dict[int, int]] = {h: {} for h in hosts}
+    fresh: list[tuple[dict, list[dict]]] = []
+
+    # Stable order so two runs with the same input allocate the same ports.
+    for s in sorted(sessions, key=lambda s: str(s.get("id") or "")):
+        host = s.get("host") or ""
+        rows = detected.get(host)
+        held = [f for f in s.get("forwards") or [] if isinstance(f, dict)]
+        # A local session needs no tunnel, and an unreachable host keeps what it
+        # has — but either way those local ports are still spoken for.
+        if not host or not hcs.get(host) or rows is None:
+            taken |= {f["local"] for f in held if isinstance(f.get("local"), int)}
+            continue
+        if not held and not opt_in(s):
+            continue
+        want = desired_forwards(s, rows, cfg, taken, established[host])
+        before = {(f.get("remote"), f.get("local")) for f in held}
+        s["forwards"] = want
+        s["ports_checked"] = int(time.time())
+        added = [f for f in want if (f["remote"], f["local"]) not in before]
+        if added:
+            fresh.append((s, added))
+        want_by_host[host].update({f["local"]: f["remote"] for f in want})
+
+    for host, want in want_by_host.items():
+        hc = hcs.get(host)
+        if hc is None or detected.get(host) is None:
+            continue
+        state = established[host]
+        if want == state:
+            continue
+        if want and not tunnel_up(hc):
+            continue
+        for local, remote in sorted(state.items()):
+            if want.get(local) != remote:
+                forward_change(hc, cfg, "cancel", local, remote)
+        applied = {l: r for l, r in state.items() if want.get(l) == r}
+        for local, remote in sorted(want.items()):
+            if state.get(local) == remote or forward_change(hc, cfg, "forward", local, remote):
+                applied[local] = remote
+        if applied:
+            save_tunnel_state(hc, applied)
+        else:
+            tunnel_down(hc)
+    return fresh
+
+
+def announce_forwards(hc: dict, session: str, forwards: list[dict],
+                      added: list[dict]) -> None:
+    """Tell an attached session about its forwards, without touching the tty.
+
+    display-message lands on tmux's status line, underneath whatever full-screen
+    UI the agent is drawing — the one way to say something to a person who is
+    mid-session. @luv_ports is set regardless, for anyone who would rather have
+    it permanently in their own status-right.
+    """
+    argv = ssh_base(hc, batch=True, control=str(tunnel_socket(hc)))
+    summary = " ".join(f"{f['local']}:{f['label']}" for f in forwards)
+    cmds = [["tmux", "set-option", "-t", session, "@luv_ports", summary]]
+    if added:
+        note = ", ".join(f"localhost:{f['local']} → {f['label']}" for f in added)
+        cmds.append(["tmux", "display-message", "-t", session, f"luv: {note}"])
+    for cmd in cmds:
+        run(argv + [remote_shell(shlex.join(cmd))], timeout=5)
+
+
+PORT_KEYS = ("forwards", "ports", "ports_checked")  # cached in sessions.json
+
+
+def log_ports(message: str) -> None:
+    """Append to ~/.luv/ports.log — the watcher's only outlet.
+
+    It runs while a full-screen agent UI owns the terminal, so it has nowhere
+    else to put a complaint.
+    """
+    with contextlib.suppress(OSError):
+        LUV_DIR.mkdir(parents=True, exist_ok=True)
+        with PORTS_LOG.open("a") as fh:
+            fh.write(f"{int(time.time())} {message}\n")
+
+
+def merge_port_state(rows: list[dict]) -> None:
+    """Write the port columns back, re-reading under the lock.
+
+    The same care the PR cache takes: another luv may have appended a session
+    while we were talking to the host, and only these keys are ours to replace.
+    """
+    cached = {s["id"]: {k: s[k] for k in PORT_KEYS if k in s}
+              for s in rows if s.get("id")}
+    cached = {sid: keys for sid, keys in cached.items() if keys}
+    if not cached:
+        return
+    with session_lock():
+        stored = load_sessions()
+        for s in stored:
+            if s.get("id") in cached:
+                s.update(cached[s["id"]])
+        save_sessions(stored)
+
+
+def attach_port_info(rows: list[dict], detected: dict[str, list[dict] | None]) -> bool:
+    """Record the ports each session was seen listening on. Reports any change.
+
+    Separate from forwarding on purpose — `luv ls` shows this for every session
+    without opening a tunnel to any of them.
+    """
+    changed = False
+    for s in rows:
+        found = detected.get(s.get("host") or "")
+        if found is None:
+            continue
+        ports = [row["port"] for row in session_ports(s, found)]
+        changed = changed or s.get("ports") != ports
+        s["ports"] = ports
+    return changed
+
+
+def port_watch(hc: dict | None, sid: str | None = None,
+               session: str | None = None):
+    """A watcher callback for an attached remote session, or None.
+
+    Local sessions have nothing to forward: the servers are already here.
+    """
+    if hc is None or not ports_config()["auto"]:
+        return None
+
+    def mine(s: dict) -> bool:
+        # @luv_id first: a just-dispatched session is still luv-pending-<id>
+        # here and its name is the one thing about to change.
+        if sid and s.get("id") == sid:
+            return True
+        return bool(session) and s.get("session") == session
+
+    def step() -> None:
+        host = hc["host"]
+        rows = query_ports(hc)
+        if rows is None:
+            return
+        stored = load_sessions()
+        watched = {s.get("id") for s in stored
+                   if (s.get("host") or "") == host and mine(s) and s.get("id")}
+        if not watched:
+            return
+        fresh = sync_forwards(stored, {host: rows},
+                              opt_in=lambda s: s.get("id") in watched)
+        attach_port_info([s for s in stored if s.get("id") in watched],
+                         {host: rows})
+        merge_port_state(stored)
+        for entry, added in fresh:
+            name = next((r["session"] for r in session_ports(entry, rows) if r["session"]),
+                        entry.get("session"))
+            if name:
+                announce_forwards(hc, name, entry.get("forwards") or [], added)
+
+    return step
+
+
+def start_port_watcher(step) -> None:
+    """Run `step` on a timer for as long as this process lives.
+
+    A daemon thread, so exiting never waits on it, and silent by construction:
+    the terminal belongs to a full-screen agent UI and anything written there
+    from here would land in the middle of somebody's redraw. What it has to say
+    goes to tmux's status line; what goes wrong goes to the log.
+    """
+    interval = max(2, int(ports_config()["interval"] or 10))
+
+    def loop() -> None:
+        while True:
+            time.sleep(interval)
+            try:
+                step()
+            except Exception as exc:  # a watcher must never take the session down
+                log_ports(f"watch failed: {exc!r}")
+
+    threading.Thread(target=loop, daemon=True).start()
 
 
 def tar_send_argv(hc: dict | None, cwd: Path, members: list[str]) -> list[str]:
@@ -2010,12 +2675,25 @@ def session_sort_key(s: dict) -> int:
     return int(s.get("activity") or s.get("last_seen") or s.get("created") or 0)
 
 
+def ports_cell(s: dict, limit: int = 4) -> str:
+    """Detected ports for the session table, kept short.
+
+    PROMPT is the one elastic column, so every port listed here is width taken
+    off it. Four and an overflow count is enough to see that something is up.
+    """
+    ports = [p for p in (s.get("ports") or []) if isinstance(p, int)]
+    if not ports:
+        return "-"
+    shown = ",".join(str(p) for p in ports[:limit])
+    return shown if len(ports) <= limit else f"{shown},+{len(ports) - limit}"
+
+
 def print_sessions(rows: list[dict]) -> None:
     """Print the session table, truncating the prompt to the terminal width."""
     headers = ("HOST", "SESSION", "WORKSPACE", "AGENT", "ATTACHED", "ACTIVE",
-               "PR", "PROMPT")
+               "PR", "PORTS", "PROMPT")
     last = len(headers) - 1  # PROMPT is the elastic column: truncated, not padded
-    pr_col = last - 1
+    pr_col = last - 2
     table, links = [], []
     for s in rows:
         url = s.get("pr_url")
@@ -2032,6 +2710,7 @@ def print_sessions(rows: list[dict]) -> None:
             "?" if s.get("live") is None else ("yes" if s.get("attached") else "no"),
             relative_age(session_sort_key(s)),
             pr,
+            ports_cell(s),
             (s.get("prompt") or "-").replace("\n", " "),
         ))
     widths = [max(len(headers[i]), max(len(r[i]) for r in table)) for i in range(last)]
@@ -2074,6 +2753,11 @@ def cmd_ls(args: list[str], identity: str | None = None) -> None:
     if not rows:
         print("luv: no sessions")
         return
+    # Detected only — listing sessions must not open a tunnel to every one of
+    # them. `luv ports <repo> <n>` is where forwarding is asked for.
+    if "--no-ports" not in args and attach_port_info(
+            rows, probe_ports(sessions, identity, host_filter)):
+        merge_port_state(rows)
     if "--no-pr" not in args and attach_pr_links(rows):
         # Re-read under the lock rather than writing back the list we already
         # have: a concurrent dispatch may have appended an entry since
@@ -2087,6 +2771,165 @@ def cmd_ls(args: list[str], identity: str | None = None) -> None:
             save_sessions(stored)
     rows.sort(key=session_sort_key, reverse=True)
     print_sessions(rows)
+
+
+def probe_ports(sessions: list[dict], identity: str | None = None,
+                host_filter: str | None = None) -> dict[str, list[dict] | None]:
+    """Ask every known host what its luv sessions are listening on.
+
+    One round trip per host, concurrently, the same shape as reconcile.
+    """
+    hosts = known_hosts(sessions, host_filter)
+    return dict(zip(hosts, fan_out(
+        lambda h: query_ports(resolve_host(h, identity) if h else None), hosts)))
+
+
+def port_rows(sessions: list[dict],
+              detected: dict[str, list[dict] | None]) -> list[dict]:
+    """One row per port, whether or not it is forwarded."""
+    out = []
+    for s in sorted(sessions, key=session_sort_key, reverse=True):
+        found = detected.get(s.get("host") or "") or []
+        forwards = {f["remote"]: f for f in (s.get("forwards") or [])
+                    if isinstance(f, dict) and isinstance(f.get("remote"), int)}
+        seen = set()
+        for row in session_ports(s, found):
+            seen.add(row["port"])
+            fwd = forwards.get(row["port"])
+            out.append({"host": s.get("host") or "local",
+                        "workspace": s.get("workspace") or "-",
+                        "remote": row["port"],
+                        "local": fwd.get("local") if fwd else None,
+                        "label": row["label"] or "-",
+                        "state": "up" if fwd else "detected"})
+        # A forward whose server has stopped is worth saying out loud rather
+        # than letting the row disappear; --no-sync is where this shows up.
+        for remote, fwd in sorted(forwards.items()):
+            if remote not in seen:
+                out.append({"host": s.get("host") or "local",
+                            "workspace": s.get("workspace") or "-",
+                            "remote": remote, "local": fwd.get("local"),
+                            "label": fwd.get("label") or "-", "state": "stale"})
+    return out
+
+
+def print_ports(rows: list[dict]) -> None:
+    """Print the port table, with the local URL as a clickable link."""
+    headers = ("HOST", "WORKSPACE", "REMOTE", "LOCAL", "URL", "SERVICE", "STATE")
+    url_col = 4
+    table, links = [], []
+    for r in rows:
+        local = r.get("local")
+        url = f"http://localhost:{local}" if local and r["state"] == "up" else None
+        links.append(url)
+        table.append((r["host"], r["workspace"], str(r["remote"]),
+                      str(local) if local else "-", url or "-",
+                      r["label"], r["state"]))
+    widths = [max(len(headers[i]), max((len(t[i]) for t in table), default=0))
+              for i in range(len(headers))]
+    print("  ".join(h.ljust(widths[i]) for i, h in enumerate(headers)).rstrip())
+    for row, url in zip(table, links):
+        cells = [row[i].ljust(widths[i]) for i in range(len(headers))]
+        # Pad outside the escape so the link covers the URL, not trailing space.
+        cells[url_col] = (hyperlink(url, row[url_col])
+                          + " " * (widths[url_col] - len(row[url_col])))
+        print("  ".join(cells).rstrip())
+
+
+def drop_forwards(matched: list[dict], identity: str | None) -> int:
+    """Cancel every forward the matched sessions hold. Returns how many."""
+    cfg = ports_config()
+    by_host: dict[str, dict[int, int]] = {}
+    dropped = 0
+    for s in matched:
+        for f in s.get("forwards") or []:
+            if isinstance(f.get("local"), int) and isinstance(f.get("remote"), int):
+                by_host.setdefault(s.get("host") or "", {})[f["local"]] = f["remote"]
+                dropped += 1
+        s["forwards"] = []
+    for host, drop in by_host.items():
+        hc = resolve_host(host, identity) if host else None
+        if hc is None:
+            continue
+        state = load_tunnel_state(hc)
+        for local, remote in sorted(drop.items()):
+            forward_change(hc, cfg, "cancel", local, remote)
+            state.pop(local, None)
+        # Nothing left to carry means nothing left to keep a connection open for.
+        save_tunnel_state(hc, state) if state else tunnel_down(hc)
+    return dropped
+
+
+def cmd_ports(args: list[str], identity: str | None = None) -> None:
+    """Show what luv sessions are listening on, and forward it here.
+
+    Naming a session is what opts it into forwarding — a busy host carries
+    dozens, and they should not all get a piece of this machine's port space
+    uninvited. With no name this refreshes whatever is already forwarded, which
+    is how a session stays reachable after you detach.
+    """
+    host_filter = None
+    if "--host" in args:
+        idx = args.index("--host")
+        if idx + 1 >= len(args):
+            die("--host requires a host name")
+        host_filter = args[idx + 1]
+        args = args[:idx] + args[idx + 2:]
+
+    interval = max(2, int(ports_config()["interval"] or 10))
+    if "--watch" in args:
+        idx = args.index("--watch")
+        if idx + 1 < len(args) and args[idx + 1].isdigit():
+            interval = max(2, int(args[idx + 1]))
+            args = args[:idx + 1] + args[idx + 2:]
+
+    off = "--off" in args
+    no_sync = "--no-sync" in args
+    watching = "--watch" in args
+    args = [a for a in args if a not in ("--off", "--no-sync", "--watch")]
+    named = bool(args)
+
+    def pass_once() -> bool:
+        sessions, _ = refresh_sessions(identity)
+        scoped = [s for s in sessions
+                  if not host_filter or s.get("host") == host_filter]
+        matched, label = filter_sessions(scoped, args)
+        if not matched:
+            print(f"luv: no sessions{label}")
+            return False
+
+        if off:
+            dropped = drop_forwards(matched, identity)
+            merge_port_state(matched)
+            print(f"luv: dropped {dropped} forward{'' if dropped == 1 else 's'}")
+            return False
+
+        detected = probe_ports(sessions, identity, host_filter)
+        attach_port_info(sessions, detected)
+        if not no_sync:
+            opted = {s.get("id") for s in matched if s.get("id")} if named else set()
+            sync_forwards(sessions, detected, identity,
+                          opt_in=lambda s: s.get("id") in opted)
+        merge_port_state(sessions)
+
+        rows = port_rows(matched, detected)
+        if not rows:
+            print(f"luv: no ports detected{label}")
+            return True
+        print_ports(rows)
+        return True
+
+    if not watching:
+        pass_once()
+        return
+    try:
+        while True:
+            if not pass_once():
+                return
+            time.sleep(interval)
+            print()
+    except KeyboardInterrupt:
+        return
 
 
 def workspace_number(repo: str, folder: str) -> int | None:
@@ -2603,6 +3446,9 @@ Commands:
   luv config list                         show all settings
   luv --init                              configure default GitHub org only
   luv ls [--host H] [--prune] [--no-pr]   list every live session on every host
+  luv ports [<repo> [n]] [--watch [N]]    show detected ports; naming a session
+                                          forwards them to localhost
+  luv ports --off [<repo> [n]]            drop forwards again
   luv continue [<repo> [number]]          attach to a live session
   luv handover [<repo> [n]] --to HOST     move a session to another machine
   luv rm <session|workspace>...           kill a session and delete its folder
@@ -2629,6 +3475,13 @@ Remote:
   'luv handover' moves a running session — workspace, uncommitted work, and the
   agent's conversation — to another machine, then resumes it there.
   Requires luv, tmux, gh and git on the remote. See docs/remote-sessions.md.
+
+Ports:
+  Servers an agent starts on a remote host are found by luv and forwarded to
+  this machine on the same port number where it is free. The session you are
+  attached to is forwarded automatically as servers come and go, and says so on
+  the tmux status line; anything else is opted in with 'luv ports <repo> <n>'.
+  'luv ls' shows what was detected without forwarding it.
 
 Naming:
   Workspaces are {repo}-{machine}-{number} and branches luv-{machine}-{number},
@@ -2660,8 +3513,16 @@ Docker:
         cmd_paths()
         return
 
+    if args[0] == "--listening":
+        cmd_listening()
+        return
+
     if args[0] == "ls":
         cmd_ls(args[1:], identity)
+        return
+
+    if args[0] == "ports":
+        cmd_ports(args[1:], identity)
         return
 
     if args[0] == "continue":

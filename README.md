@@ -98,7 +98,9 @@ also keeps reusing its workspace — it names a workspace, where a URL names a P
 | `luv config set\|get\|unset <key> [value]` | Read or write a single setting |
 | `luv config list` | Show all settings |
 | `luv --init` | Configure default GitHub org only |
-| `luv ls [--host H] [--prune] [--no-pr]` | List every live session on every host, with each one's PR link |
+| `luv ls [--host H] [--prune] [--no-pr] [--no-ports]` | List every live session on every host, with each one's PR link and detected ports |
+| `luv ports [<repo> [n]] [--watch [N]]` | Show ports the sessions are listening on; naming one forwards it to localhost |
+| `luv ports --off [<repo> [n]]` | Drop forwards again |
 | `luv continue [<repo> [number]]` | Attach to a live session |
 | `luv handover [<repo> [n]] --to HOST` | Move a session to another machine and resume it there |
 | `luv rm <session\|workspace>...` | Kill a session and delete its workspace on its host |
@@ -211,6 +213,20 @@ luv continue                        # reattach exactly where you left off
 `luv ls` lists what is running on every host it knows about, not only the sessions this machine started — a session dispatched from your laptop shows up on your desktop, and `luv continue` and `luv rm` reach it from either.
 
 Use `--local` for a one-off local run, `-s HOST` to target a different machine, and `-i PATH` for a different SSH key.
+
+### Reaching servers the agent started
+
+Agents working on a remote start servers there. luv finds them and forwards them to this machine on the same port number wherever it's free, so the URL in the agent's output is the URL that works for you.
+
+```bash
+luv ls                       # PORTS column: what was detected, on every session
+luv ports myrepo 42          # forward that session's ports to localhost
+luv ports --off myrepo 42    # drop them again
+```
+
+The session you're **attached to** is forwarded automatically as servers come and go, and announces each one on the tmux status line (`luv: localhost:3000 → dashboard`) — nothing to run. Everything else is opted in by name, because a busy host carries dozens of sessions and they shouldn't all claim local ports uninvited.
+
+Both processes under the session's tmux pane and Docker Compose stacks belonging to the workspace are found; forwards bind `127.0.0.1`, and they outlive detaching so a long-running session stays reachable.
 
 ### Handing a session to another machine
 

@@ -256,6 +256,85 @@ luv -i ~/.ssh/other_key myrepo      # use a different key this once
 Detach from a session with `Ctrl-b d` (tmux's default prefix). The agent keeps
 running.
 
+## Reaching servers the agent started
+
+An agent working on the remote starts servers there — a dev server, a compose
+stack, a database. luv finds them and tunnels them to this machine, on the same
+port number wherever it is free, so the URL the agent prints in its own output
+is the URL that works here.
+
+**The session you are attached to is forwarded automatically.** It is re-checked
+every few seconds, so a server started ten minutes into a session is reachable
+shortly after it comes up, without running anything. When a forward appears the
+session says so on its tmux status line:
+
+```
+luv: localhost:3000 → dashboard, localhost:8080 → server
+```
+
+The ports are also set on the tmux session as `@luv_ports`, if you would rather
+have them permanently in your own `status-right`.
+
+**Everything else is opted in by name.** A busy host carries dozens of sessions
+and they should not all get a piece of this machine's port space uninvited:
+
+```bash
+luv ls                          # PORTS column: what was detected, forwarded or not
+luv ports                       # detail view; refreshes what is already forwarded
+luv ports myrepo 42             # forward this session's ports
+luv ports myrepo 42 --watch     # ...and keep it up to date, printing each change
+luv ports --off myrepo 42       # drop them again
+luv ports --off                 # drop everything
+```
+
+```
+HOST  WORKSPACE      REMOTE  LOCAL  URL                    SERVICE    STATE
+box   myrepo-box-42    3000   3001  http://localhost:3001  dashboard  up
+box   myrepo-box-42    5173   5173  http://localhost:5173  vite       up
+box   other-box-17     5432   5432  -                      postgres   detected
+```
+
+Forwards outlive detaching — the session is still running and `localhost:3000`
+should keep working — so `luv ports myrepo 42` is also how a long-running
+session stays reachable after you close the window.
+
+`REMOTE` and `LOCAL` differ when the local number was already taken, by another
+session or by something of your own; luv walks up from the remote number and
+remembers what it chose, so the URL stays put across runs.
+
+### What gets found
+
+Two sources, because neither sees everything:
+
+- **Processes under the session's tmux pane.** A server the agent started
+  itself — `npm run dev`, `python -m http.server` — is a descendant of the pane,
+  which is what ties the port to a session. Only your own processes are visible
+  this way, so other people's services on a shared box never appear.
+- **Docker Compose stacks belonging to the workspace.** A published port is held
+  by `docker-proxy` rather than by anything under the pane, so the Compose
+  project label answers instead. Both the project luv starts (`luv-<workspace>`)
+  and the one an agent gets by running `docker compose up` itself (named after
+  the workspace folder) count as the workspace's.
+
+A port that is only *exposed* to the Compose network — `9009/tcp` with no host
+mapping — has nothing on the host to point a tunnel at and is not offered. Add a
+`ports:` entry to the compose file if you want it.
+
+Forwards bind `127.0.0.1` on this machine, so nothing is republished to your
+network. See [`ports.*`](configuration.md#ports) to change the interval, the
+bind address, or which ports are skipped, and `ports.auto` to turn the automatic
+half off entirely.
+
+### When it doesn't work
+
+- **Nothing detected, and the host is otherwise fine.** The host needs a luv new
+  enough to know `luv --listening`; an older one reports nothing rather than
+  failing. Upgrade luv there.
+- **`warning: <host> refuses port forwarding`.** That host's `sshd_config` has
+  `AllowTcpForwarding no`.
+- **A forward that stopped working.** The watcher logs to `~/.luv/ports.log`; it
+  cannot print while a full-screen agent UI owns the terminal.
+
 ## Handing a session to another machine
 
 `luv handover` relocates a running workspace. The usual direction is laptop →

@@ -42,7 +42,10 @@ the session (which luv does as soon as the clone lands) breaks nothing.
       "pr_number": 42,
       "pr_url": "https://github.com/exosphere/myrepo/pull/42",
       "pr_state": "OPEN",
-      "pr_checked": 1753408899
+      "pr_checked": 1753408899,
+      "ports": [3000, 5173],
+      "forwards": [{"remote": 3000, "local": 3001, "label": "dashboard"}],
+      "ports_checked": 1753408899
     }
   ]
 }
@@ -65,6 +68,9 @@ the session (which luv does as soon as the clone lands) breaks nothing.
 | `pr_checked` | Unix time GitHub was last asked about it |
 | `pr_hint` | PR number known at dispatch (`-l` / `-pr` only); absent otherwise. Set even when the folder isn't yet known, which is always the case for `-l` |
 | `adopted` | Present when this machine found the session rather than starting it |
+| `ports` | Ports the session was last seen listening on, on its own host |
+| `forwards` | Live tunnels to this machine: `remote` port, the `local` one it landed on, and the service `label`. Persisted so a URL stays put across runs, and so a forward survives detaching |
+| `ports_checked` | Unix time the forwards were last brought in line |
 
 `attached`, `activity`, and `live` are recomputed on every reconcile and are
 deliberately **not** written back to the file.
