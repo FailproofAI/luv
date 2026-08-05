@@ -13,6 +13,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 try:
@@ -1680,6 +1681,19 @@ def continue_hint(repo: str | None, workspace: str | None = None) -> str:
     return " ".join(parts)
 
 
+def dispatched_workspace(hc: dict, sid: str) -> str | None:
+    """The workspace a dispatched session landed in, asked of the host.
+
+    Dispatch only knows the folder name when the number was on the command
+    line; otherwise the remote reads it off gh api and stamps it onto its own
+    tmux session, and asking is the only way back to it from here.
+    """
+    for row in query_tmux(hc) or []:
+        if row["id"] == sid:
+            return row["workspace"] or None
+    return None
+
+
 def reopen_hint(args: list[str]) -> str:
     """The 'luv <repo> [n] -r' line for a session whose tmux is already gone.
 
@@ -1692,7 +1706,7 @@ def reopen_hint(args: list[str]) -> str:
 
 
 def hand_over(argv: list[str], *, restore: bool = True, watch=None,
-              hint: str | None = None) -> None:
+              hint: str | Callable[[], str] | None = None) -> None:
     """Give the terminal to a child and exit with its status. Never returns.
 
     Without `restore` this is a plain execv, which is the better deal when
@@ -1716,7 +1730,9 @@ def hand_over(argv: list[str], *, restore: bool = True, watch=None,
     is either a detach or the agent finishing, and neither wants advice; a bad
     one is usually ssh losing the connection out from under a session that is
     still running on the other side, and the terminal it lands back in should
-    not have to be told twice how to get there.
+    not have to be told twice how to get there. It may be a callable, for the
+    hint that cannot be written until the session it describes has run: only
+    the bad exit pays for working it out, and only once.
     """
     if not restore:
         os.execv(argv[0], argv)
@@ -1734,15 +1750,16 @@ def hand_over(argv: list[str], *, restore: bool = True, watch=None,
                     # for itself what to do with it; outliving it is the point.
                     continue
         if code != 0 and hint:
+            line = hint() if callable(hint) else hint
             # After the guard, not inside it: a terminal still in the remote
             # program's modes is no place to print something to be copied.
             print(f"\nluv: session ended unexpectedly — continue it with:\n\n"
-                  f"    {hint}\n", file=sys.stderr)
+                  f"    {line}\n", file=sys.stderr)
         sys.exit(code)
 
 
 def exec_ssh(hc: dict, remote_cmd: str, *, tty: bool = True, watch=None,
-             hint: str | None = None) -> None:
+             hint: str | Callable[[], str] | None = None) -> None:
     """Hand the terminal to ssh. Never returns."""
     ssh_bin = shutil.which("ssh")
     if not ssh_bin:
@@ -1751,7 +1768,8 @@ def exec_ssh(hc: dict, remote_cmd: str, *, tty: bool = True, watch=None,
     hand_over([ssh_bin] + argv[1:], restore=tty, watch=watch, hint=hint)
 
 
-def attach_session(hc: dict | None, name: str, *, hint: str | None = None) -> None:
+def attach_session(hc: dict | None, name: str, *,
+                   hint: str | Callable[[], str] | None = None) -> None:
     """Attach to a tmux session, locally or over ssh. Never returns.
 
     -d detaches other clients so the pane isn't size-clamped to a stale window
@@ -1879,7 +1897,8 @@ def dispatch_remote(hc: dict, remote_args: list[str], *, workspace: str | None =
 
     # Only a tmux session is there to come back to; -nit and --clean run to
     # completion over ssh and have nothing to continue.
-    hint = continue_hint((meta or {}).get("repo"), workspace) if use_tmux else None
+    repo = (meta or {}).get("repo")
+    hint = continue_hint(repo, workspace) if use_tmux else None
     print(f"luv: {hc['host']} — {session or 'no tmux'}")
     if detach:
         r = run(ssh_base(hc, batch=True) + [remote_shell(cmd)])
@@ -1887,6 +1906,16 @@ def dispatch_remote(hc: dict, remote_args: list[str], *, workspace: str | None =
             die(f"could not start {session} on {hc['host']}: {r.stderr.strip()}")
         print(f"luv: started detached — attach with: {hint or 'luv continue'}")
         return
+    def late_hint() -> str:
+        """The same hint, worked out after the session rather than before it."""
+        return continue_hint(repo, dispatched_workspace(hc, sid))
+
+    # A dispatch without a number is the ordinary case, and the repo on its own
+    # points at whichever of its sessions is newest — which by then may not be
+    # this one. Deferring costs a round trip only when a session breaks, and by
+    # then the remote has long since picked its number and stamped it on tmux.
+    if use_tmux and repo and not workspace:
+        hint = late_hint
     exec_ssh(hc, cmd, tty=tty, watch=port_watch(hc, sid=sid, session=session),
              hint=hint)
 

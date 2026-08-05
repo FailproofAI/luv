@@ -479,6 +479,54 @@ class ContinueHintTests(unittest.TestCase):
         self.assertEqual(hand_over.call_args.kwargs.get("hint"),
                          "luv continue myrepo 42")
 
+    def _dispatch_hint(self, tmux_rows, **kwargs):
+        """The hint a numberless dispatch hands back, against a host that
+        answers with `tmux_rows`."""
+        with (patch.object(luv.shutil, "which", side_effect=lambda n: f"/bin/{n}"),
+              patch.object(luv, "record_session"),
+              patch.object(luv, "port_watch", return_value=None),
+              patch.object(luv, "query_tmux", return_value=tmux_rows) as query,
+              patch.object(luv, "hand_over") as hand_over,
+              contextlib.redirect_stdout(io.StringIO())):
+            luv.dispatch_remote({"host": "box"}, ["myrepo"],
+                                meta={"repo": "myrepo", "org": "acme"}, **kwargs)
+            hint = hand_over.call_args.kwargs.get("hint")
+            # Nothing is asked of the host until the hint is actually needed.
+            self.assertFalse(query.called)
+            return hint() if callable(hint) else hint
+
+    def test_a_session_dispatched_without_a_number_finds_its_own(self):
+        # The number comes off gh api on the remote, so the only way to name it
+        # is to ask the session that picked it — once, and only if it breaks.
+        rows = [{"id": "other123", "session": "luv-myrepo-box-7",
+                 "workspace": "myrepo-box-7", "attached": False, "activity": 0}]
+        with patch.object(luv, "new_session_id", return_value="abc12345"):
+            rows.append({"id": "abc12345", "session": "luv-myrepo-box-42",
+                         "workspace": "myrepo-box-42", "attached": True,
+                         "activity": 0})
+            hint = self._dispatch_hint(rows)
+
+        self.assertEqual(hint, "luv continue myrepo 42")
+
+    def test_an_unreachable_host_still_hands_back_a_runnable_line(self):
+        # query_tmux returns None when the host never answered — which is the
+        # usual reason a session broke in the first place.
+        self.assertEqual(self._dispatch_hint(None), "luv continue myrepo")
+
+    def test_a_detached_start_does_not_wait_on_a_number(self):
+        # Nothing has been cloned yet, so there is no number to find; the line
+        # printed here has to be one, not a deferred callable.
+        with (patch.object(luv, "run", return_value=_FakeProc(0)),
+              patch.object(luv.shutil, "which", side_effect=lambda n: f"/bin/{n}"),
+              patch.object(luv, "record_session"),
+              patch.object(luv, "query_tmux") as query,
+              contextlib.redirect_stdout(io.StringIO()) as out):
+            luv.dispatch_remote({"host": "box"}, ["myrepo"], detach=True,
+                                meta={"repo": "myrepo", "org": "acme"})
+
+        self.assertFalse(query.called)
+        self.assertIn("attach with: luv continue myrepo", out.getvalue())
+
     def test_a_run_with_no_session_behind_it_gets_no_hint(self):
         # -nit streams to a pipe and exits; there is nothing to continue.
         with (patch.object(luv.shutil, "which", side_effect=lambda n: f"/bin/{n}"),
