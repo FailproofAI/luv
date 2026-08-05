@@ -265,6 +265,12 @@ luv: session ended unexpectedly — continue it with:
     luv continue myrepo 42
 ```
 
+The number is there even when you never typed one: `luv myrepo "…"` doesn't
+know which workspace it will get — the remote reads that off `gh api` — so the
+line is worked out at the point it is printed, by asking the session which
+folder it ended up in. Without it the hint would name the repo alone, and that
+attaches to whichever of its sessions is newest, which may not be this one.
+
 Copy that line and run it. If the agent took the tmux session down with it,
 there is nothing left to attach to; `luv continue` says so and hands you
 `luv myrepo 42 -r`, which reopens the workspace and resumes the conversation.
