@@ -57,13 +57,13 @@ def die(msg: str) -> None:
     sys.exit(1)
 
 
-def run(cmd: list[str], *, cwd: str | None = None,
-        timeout: float | None = None) -> subprocess.CompletedProcess:
+def run(cmd: list[str], *, cwd: str | None = None, timeout: float | None = None,
+        stdin: int | None = None) -> subprocess.CompletedProcess:
     """Capture a subprocess. A timeout surfaces as a failure, not an exception,
     so callers keep their plain returncode checks."""
     try:
         return subprocess.run(cmd, capture_output=True, text=True, cwd=cwd,
-                              timeout=timeout)
+                              timeout=timeout, stdin=stdin)
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(cmd, 124, "", f"timed out after {timeout}s")
 
@@ -741,6 +741,84 @@ def collect_luv_env() -> dict[str, str]:
         if key.startswith("LUV_") and len(key) > 4:
             result[key[4:]] = value
     return result
+
+
+# An rc file is a program, and some of them never finish: one that starts tmux,
+# or waits on a prompt, would otherwise hang every session start.
+SHELL_ENV_TIMEOUT = 15
+
+# Vars that describe the shell we just ran rather than the setup we asked it
+# about. Importing them would tell the agent it is somewhere it is not.
+SHELL_ENV_SKIP = {"_", "OLDPWD", "PWD", "SHLVL"}
+
+
+def shell_env() -> dict[str, str]:
+    """Everything the user's login+interactive shell exports.
+
+    tmux and ssh exec their command directly, with no shell in between, so a
+    session luv started — a remote dispatch, a handover, a detached start —
+    never sources ~/.bashrc or ~/.zshrc. It runs with whatever environment the
+    tmux server was started with, frozen at whenever that server first came up.
+    The API key an agent authenticates with and the PATH entry that makes
+    'codex' resolvable both live in the rc, and both go missing.
+
+    Asking $SHELL for its own environment is the only way to get them back: rc
+    files are code, not data, and there is no reading them from outside. -l
+    covers the profile files, -i the rc files; between them they reach where
+    bash and zsh users actually put their exports.
+    """
+    shell = os.environ.get("SHELL") or "/bin/bash"
+    marker = "__luv_env__"
+    code = ("import json,os,sys;"
+            f"sys.stdout.write({marker!r} + json.dumps(dict(os.environ)))")
+    probe = f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
+    # DEVNULL because an interactive shell sharing our tty would fight the
+    # agent for it, and lose to SIGTTOU rather than to the timeout.
+    r = run([shell, "-lic", probe], timeout=SHELL_ENV_TIMEOUT,
+            stdin=subprocess.DEVNULL)
+    # Match on the marker, not the exit status: rc files greet, warn, and fail
+    # in ways that say nothing about whether the environment came back. What
+    # precedes the marker is the greeting; raw_decode drops anything an exit
+    # hook prints after it.
+    if marker not in r.stdout:
+        return {}
+    try:
+        env, _ = json.JSONDecoder().raw_decode(r.stdout.split(marker, 1)[1].lstrip())
+    except ValueError:
+        return {}
+    return {k: v for k, v in env.items() if isinstance(v, str)}
+
+
+def merged_path(current: str, from_rc: str) -> str:
+    """`current` first, then whatever the rc adds. PATH order is a precedence
+    list, so the binaries that got us this far keep winning."""
+    entries = [p for p in current.split(os.pathsep) if p]
+    entries += [p for p in from_rc.split(os.pathsep) if p and p not in entries]
+    return os.pathsep.join(entries)
+
+
+def apply_shell_env() -> None:
+    """Fill this process's environment in from the user's shell.
+
+    Only for the luv that tmux or ssh started (_LUV_INNER). A luv you ran
+    yourself already inherited the shell it ran in; re-deriving it there would
+    charge every session start for an rc that has already run.
+
+    What is already set wins. 'FOO=bar luv …' and -e are statements about this
+    session, while the rc is the background default, and a session that quietly
+    overrode the value you handed it would be worse than one missing it. PATH
+    is the exception, being a list rather than a value: the rc's entries are
+    appended, which is how nvm's node and ~/.local/bin become findable.
+    """
+    if not os.environ.get("_LUV_INNER") or load_config().get("shell_env") is False:
+        return
+    for key, value in shell_env().items():
+        if key in SHELL_ENV_SKIP:
+            continue
+        if key == "PATH":
+            os.environ["PATH"] = merged_path(os.environ.get("PATH", ""), value)
+        elif key not in os.environ:
+            os.environ[key] = value
 
 
 def docker_env_flags(env_vars: dict[str, str]) -> list[str]:
@@ -3457,6 +3535,11 @@ def main() -> None:
         die("--local cannot be combined with -s or -i")
 
     args = [a for a in args if a not in ("-n", "-r", "-e", "-f", "--force", "-p", "-nit", "--safe", "--claude", "--codex", "--local", "--no-agent-state", "--no-attach", "--purge", "-y")]
+
+    # Before anything shells out: the clone needs gh and git on PATH as much as
+    # the agent needs its credentials, and both come from the same rc. Ahead of
+    # collect_luv_env() too, so a LUV_* exported there is one -e can forward.
+    apply_shell_env()
     extra_env = collect_luv_env() if env_mode else {}
 
     # _LUV_INNER marks the remote-side luv: it must never dispatch onward.
