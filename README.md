@@ -146,6 +146,32 @@ Handover flags:
 | `--purge` | Delete the source folder once the copy is verified |
 | `-y` | Skip the "an agent may still be running" confirmation |
 
+## The session's environment
+
+A session luv starts for you — a remote dispatch, a handover, a detached start
+— is exec'd by tmux or ssh with no shell in between, so it never sources
+`~/.bashrc` or `~/.zshrc` and would otherwise run with whatever environment the
+tmux server happened to start with. luv asks your login shell (`$SHELL -lic`)
+for its environment and fills in the gaps before cloning or launching anything,
+so the agent gets the API keys and the `PATH` you'd have in a terminal there.
+
+Precedence, highest first:
+
+1. Anything already set — `FOO=bar luv …`, or `-e` — is a decision about *this*
+   session and is never overwritten.
+2. Your rc's exports fill in the rest. `PATH` is merged instead of replaced:
+   entries the rc adds (nvm, pyenv, `~/.local/bin`) are appended after the ones
+   already there.
+
+The probe runs on the machine the session runs on, so a remote session picks up
+the *remote* user's rc. It is skipped when you run `luv` yourself — that
+process already inherited your shell — and can be turned off entirely with
+`luv config set shell_env false`. An rc that hangs is given 15 seconds and then
+ignored.
+
+Docker sessions are the exception: the container has its own environment, and
+only `-e` crosses into it (see below).
+
 ## Docker dev environments
 
 If a repo contains `.luv/settings.json` with a `compose_file` key, `luv` automatically starts a Docker Compose environment and runs Claude inside the `dev-environment` container.

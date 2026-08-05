@@ -70,6 +70,35 @@ pushed. Workspaces created before slugs existed keep working.
 *string, default `~/prs`.* Where workspace folders are created on **this**
 machine. `~` is expanded.
 
+### `shell_env`
+
+*boolean, default `true`.* Whether a session luv starts should inherit your
+shell's environment.
+
+tmux and ssh exec their command directly, so a remote dispatch, a handover, or
+a detached start never sources `~/.bashrc` or `~/.zshrc` — it runs with the
+environment the tmux server was started with, frozen at whenever that server
+first came up. Anything you export from your rc (the API key an agent
+authenticates with, the `PATH` entry that makes `codex` resolvable) is simply
+absent, and only for the sessions luv started for you.
+
+With this on, luv runs `$SHELL -lic` on the machine the session runs on and
+fills in what's missing before it clones or launches anything. Values already
+set win, so `FOO=bar luv …` and `-e` still decide; `PATH` is merged rather than
+replaced, with the rc's entries appended. An rc that never returns is abandoned
+after 15 seconds.
+
+Set it to `false` if your rc is slow, or if you want sessions to see only what
+you pass them explicitly:
+
+```bash
+luv config set shell_env false
+```
+
+This is read on the machine the session runs on, so a remote host can opt out
+independently of your laptop. It does not apply to Docker sessions — the
+container has its own environment, and only `-e` crosses into it.
+
 ### `remote.host`
 
 *string.* SSH destination — an `~/.ssh/config` alias (`box`), a `user@host`, or

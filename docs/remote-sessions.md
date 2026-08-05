@@ -521,6 +521,19 @@ The key isn't installed or isn't being offered. Test with `ssh -v box`. Check
 `gh` is authenticated on your laptop but not on the remote. luv numbers
 workspaces with `gh api` *on the remote*, so it needs its own login there.
 
+**The agent can't find an API key / a tool it needs is missing**
+Sessions inherit your rc: before cloning or launching, luv asks the remote's
+login shell (`$SHELL -lic`) for its environment and fills in whatever tmux
+didn't pass on, `PATH` included. So this means the var isn't exported by the
+*remote* user's `~/.bashrc`/`~/.zshrc` — check with
+`ssh box 'zsh -lic "printenv | cut -d= -f1"'` — or that the rc takes longer than
+15 seconds, or that `shell_env` is `false` there. `-e` with a `LUV_`-prefixed
+variable forwards one from your laptop regardless. See
+[configuration.md](configuration.md#shell_env).
+
+Note that this happens *inside* the remote luv, so it can't help ssh find `luv`
+itself — that's the `PATH` problem above.
+
 **My prompt didn't get sent**
 Reopening a workspace that already has a live session attaches to it, and tmux
 discards the command — so the prompt is dropped. luv prints a note when this can

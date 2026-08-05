@@ -812,6 +812,102 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("ConnectTimeout=5", base)
 
 
+def _shell_env_output(env, before="", after=""):
+    """What the probe sees: an rc's greeting, the marker, the environment."""
+    return f"{before}__luv_env__{json.dumps(env)}{after}"
+
+
+class ShellEnvTests(unittest.TestCase):
+    """tmux and ssh exec without a shell, so the rc has to be asked for."""
+
+    def _probe(self, stdout, returncode=0):
+        with (patch.dict(luv.os.environ, {"SHELL": "/bin/zsh"}, clear=True),
+              patch.object(luv, "run",
+                           return_value=_completed(stdout, returncode)) as run):
+            return luv.shell_env(), run.call_args
+
+    def test_asks_the_users_own_shell_as_login_and_interactive(self):
+        env, call = self._probe(_shell_env_output({"API_BASE": "https://x"}))
+
+        self.assertEqual(env, {"API_BASE": "https://x"})
+        self.assertEqual(call.args[0][:2], ["/bin/zsh", "-lic"])
+        self.assertEqual(call.kwargs["stdin"], subprocess.DEVNULL)
+        self.assertEqual(call.kwargs["timeout"], luv.SHELL_ENV_TIMEOUT)
+
+    def test_greeting_before_the_marker_is_ignored(self):
+        env, _ = self._probe(_shell_env_output({"A": "1"}, before="welcome back!\n"))
+
+        self.assertEqual(env, {"A": "1"})
+
+    def test_exit_hook_after_the_environment_is_ignored(self):
+        env, _ = self._probe(_shell_env_output({"A": "1"}, after="\ngoodbye\n"))
+
+        self.assertEqual(env, {"A": "1"})
+
+    def test_failing_rc_still_yields_what_it_exported(self):
+        env, _ = self._probe(_shell_env_output({"A": "1"}), returncode=1)
+
+        self.assertEqual(env, {"A": "1"})
+
+    def test_a_shell_that_says_nothing_useful_is_not_an_error(self):
+        self.assertEqual(self._probe("")[0], {})
+        self.assertEqual(self._probe("__luv_env__not json")[0], {})
+
+    def test_timeout_is_not_an_error(self):
+        # run() turns a hung rc into returncode 124 rather than an exception.
+        self.assertEqual(self._probe("", returncode=124)[0], {})
+
+
+class ApplyShellEnvTests(unittest.TestCase):
+    def _apply(self, environ, rc, config=None):
+        with (patch.dict(luv.os.environ, environ, clear=True),
+              patch.object(luv, "load_config", return_value=config or {}),
+              patch.object(luv, "shell_env", return_value=rc) as probe):
+            luv.apply_shell_env()
+            return dict(luv.os.environ), probe.called
+
+    def test_only_runs_for_the_luv_tmux_or_ssh_started(self):
+        env, probed = self._apply({}, {"API_KEY": "from-rc"})
+
+        self.assertFalse(probed)
+        self.assertNotIn("API_KEY", env)
+
+    def test_fills_in_what_the_session_never_sourced(self):
+        env, _ = self._apply({"_LUV_INNER": "1"}, {"API_KEY": "from-rc"})
+
+        self.assertEqual(env["API_KEY"], "from-rc")
+
+    def test_what_the_caller_set_wins(self):
+        env, _ = self._apply({"_LUV_INNER": "1", "API_KEY": "explicit"},
+                             {"API_KEY": "from-rc", "OTHER": "from-rc"})
+
+        self.assertEqual(env["API_KEY"], "explicit")
+        self.assertEqual(env["OTHER"], "from-rc")
+
+    def test_path_is_merged_rather_than_replaced(self):
+        env, _ = self._apply({"_LUV_INNER": "1", "PATH": "/usr/bin:/bin"},
+                             {"PATH": "/home/u/.nvm/bin:/usr/bin:/home/u/.local/bin"})
+
+        self.assertEqual(env["PATH"],
+                         "/usr/bin:/bin:/home/u/.nvm/bin:/home/u/.local/bin")
+
+    def test_the_probe_shells_own_bookkeeping_is_left_behind(self):
+        env, _ = self._apply({"_LUV_INNER": "1"},
+                             {"PWD": "/home/u", "SHLVL": "3", "_": "/usr/bin/env",
+                              "OLDPWD": "/tmp", "KEEP": "yes"})
+
+        self.assertEqual(env["KEEP"], "yes")
+        for key in ("PWD", "SHLVL", "_", "OLDPWD"):
+            self.assertNotIn(key, env)
+
+    def test_config_can_turn_it_off(self):
+        env, probed = self._apply({"_LUV_INNER": "1"}, {"API_KEY": "from-rc"},
+                                  config={"shell_env": False})
+
+        self.assertFalse(probed)
+        self.assertNotIn("API_KEY", env)
+
+
 class CleanGuardTests(unittest.TestCase):
     def test_live_session_folder_is_skipped(self):
         tempdir = tempfile.TemporaryDirectory()
