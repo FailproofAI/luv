@@ -66,7 +66,7 @@ luv continue
 1. Clones the repo into `~/prs/{repo}-{machine}-{number}/`
 2. Creates a new branch `luv-{machine}-{number}`
 3. Configures the selected agent with the workspace's PR conventions
-4. Launches Claude with Opus 5 at max effort, or Codex in YOLO mode
+4. Launches Claude with Opus 5.5 at max effort, or Codex in YOLO mode
 
 All workspaces live under `~/prs/`. The number comes from the repo's GitHub issue counter, and `{machine}` is a short name for the machine that created the workspace — by default the hostname, or whatever you set with `luv config set machine mbp`.
 
@@ -126,7 +126,7 @@ also keeps reusing its workspace — it names a workspace, where a URL names a P
 | `-r` | Resume: resume the selected agent's last session |
 | `-p` | Launch Claude in plan permission mode (default: `bypassPermissions`) |
 | `-nit` | Non-interactive: run the selected agent and exit (no REPL); Claude streams `stream-json` events to stdout |
-| `-m MODEL` | Model to use; Claude defaults to `claude-opus-5`, while Codex uses its configured CLI default |
+| `-m MODEL` | Model to use; Claude defaults to `claude-opus-5-5`, while Codex uses its configured CLI default |
 | `-b BRANCH` | Base a new workspace off `BRANCH` (clone + branch from it); recorded in `git config luv.base` so the PR can target it |
 | `-e` | Env: pass `LUV_*` environment variables (with prefix stripped) into the session |
 | `-s HOST` | Run on `HOST` over SSH, overriding the configured remote host |
