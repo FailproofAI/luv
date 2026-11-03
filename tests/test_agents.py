@@ -1,7 +1,10 @@
 import contextlib
 import io
 import json
+import os
+import pty
 import re
+import shutil
 import subprocess
 import tempfile
 import time
@@ -880,7 +883,32 @@ class ShellEnvTests(unittest.TestCase):
         self.assertEqual(env, {"API_BASE": "https://x"})
         self.assertEqual(call.args[0][:2], ["/bin/zsh", "-lic"])
         self.assertEqual(call.kwargs["stdin"], subprocess.DEVNULL)
+        self.assertTrue(call.kwargs["new_session"])
         self.assertEqual(call.kwargs["timeout"], luv.SHELL_ENV_TIMEOUT)
+
+    @unittest.skipUnless(shutil.which("zsh"), "needs zsh")
+    def test_probe_leaves_the_terminal_in_the_foreground_of_the_caller(self):
+        # A real zsh on a real pty, because only that shows the failure: zsh
+        # takes the foreground and execs the probe, so the caller, and the agent
+        # it later execs, would be stopped by SIGTTOU on touching the terminal.
+        with tempfile.TemporaryDirectory() as zdotdir:
+            pid, fd = pty.fork()
+            if pid == 0:
+                status = 1
+                try:
+                    with patch.dict(luv.os.environ,
+                                    {"SHELL": "zsh", "ZDOTDIR": zdotdir}):
+                        luv.shell_env()
+                    status = 0 if os.tcgetpgrp(0) == os.getpgrp() else 1
+                finally:
+                    os._exit(status)
+            with contextlib.suppress(OSError):
+                while os.read(fd, 4096):
+                    pass
+            os.close(fd)
+            _, status = os.waitpid(pid, 0)
+
+        self.assertEqual(os.waitstatus_to_exitcode(status), 0)
 
     def test_greeting_before_the_marker_is_ignored(self):
         env, _ = self._probe(_shell_env_output({"A": "1"}, before="welcome back!\n"))

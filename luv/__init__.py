@@ -59,12 +59,14 @@ def die(msg: str) -> None:
 
 
 def run(cmd: list[str], *, cwd: str | None = None, timeout: float | None = None,
-        stdin: int | None = None) -> subprocess.CompletedProcess:
+        stdin: int | None = None,
+        new_session: bool = False) -> subprocess.CompletedProcess:
     """Capture a subprocess. A timeout surfaces as a failure, not an exception,
     so callers keep their plain returncode checks."""
     try:
         return subprocess.run(cmd, capture_output=True, text=True, cwd=cwd,
-                              timeout=timeout, stdin=stdin)
+                              timeout=timeout, stdin=stdin,
+                              start_new_session=new_session)
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(cmd, 124, "", f"timed out after {timeout}s")
 
@@ -773,10 +775,13 @@ def shell_env() -> dict[str, str]:
     code = ("import json,os,sys;"
             f"sys.stdout.write({marker!r} + json.dumps(dict(os.environ)))")
     probe = f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
-    # DEVNULL because an interactive shell sharing our tty would fight the
-    # agent for it, and lose to SIGTTOU rather than to the timeout.
+    # A session of its own, so the probe has no controlling tty to touch. An
+    # interactive zsh opens /dev/tty whatever stdin is and makes its own process
+    # group the foreground one, then execs the probe rather than forking it, so
+    # nothing is left to hand the terminal back. luv and the agent it execs would
+    # be in the background, and the agent's first tcsetattr gets SIGTTOU.
     r = run([shell, "-lic", probe], timeout=SHELL_ENV_TIMEOUT,
-            stdin=subprocess.DEVNULL)
+            stdin=subprocess.DEVNULL, new_session=True)
     # Match on the marker, not the exit status: rc files greet, warn, and fail
     # in ways that say nothing about whether the environment came back. What
     # precedes the marker is the greeting; raw_decode drops anything an exit
