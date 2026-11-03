@@ -59,13 +59,14 @@ def die(msg: str) -> None:
 
 
 def run(cmd: list[str], *, cwd: str | None = None, timeout: float | None = None,
-        stdin: int | None = None,
+        stdin: int | None = None, input: str | None = None,
+        env: dict[str, str] | None = None,
         new_session: bool = False) -> subprocess.CompletedProcess:
     """Capture a subprocess. A timeout surfaces as a failure, not an exception,
     so callers keep their plain returncode checks."""
     try:
         return subprocess.run(cmd, capture_output=True, text=True, cwd=cwd,
-                              timeout=timeout, stdin=stdin,
+                              timeout=timeout, stdin=stdin, input=input, env=env,
                               start_new_session=new_session)
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(cmd, 124, "", f"timed out after {timeout}s")
@@ -883,6 +884,48 @@ def ensure_default_permission_mode() -> None:
         tmp.write("\n")
         tmp_path = Path(tmp.name)
     os.replace(tmp_path, CLAUDE_SETTINGS_JSON)
+
+
+# Asking for a credential runs whatever helpers git is configured with, and one
+# that is stuck must not hold up every session start.
+GIT_CREDENTIAL_TIMEOUT = 10
+
+
+def ensure_git_credentials() -> None:
+    """Point git at gh's GitHub login, if git has none of its own.
+
+    luv looks a repo up with gh and then clones it with git, and those two keep
+    separate credentials. 'gh auth login --with-token' sets up only gh's, and a
+    public repo clones without any, so such a machine seems fine until a private
+    repo stops at a Username prompt, or an agent tries to push anything at all.
+
+    A login git already has is left alone. It may be another account on purpose,
+    and this setting reaches every repo on the machine, not just luv's.
+    """
+    if not (shutil.which("git") and shutil.which("gh")):
+        return
+    # Only what git can find by itself: with no credential, the fallbacks it would
+    # otherwise reach for are a terminal prompt, an askpass program and a browser.
+    r = run(["git", "credential", "fill"],
+            input="protocol=https\nhost=github.com\n\n",
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "",
+                 "GCM_INTERACTIVE": "never"},
+            timeout=GIT_CREDENTIAL_TIMEOUT)
+    # 128 is git giving up at the prompt we turned off. A timeout is a helper
+    # waiting on something, which says nothing about whether it has a login.
+    if r.returncode != 128:
+        return
+    r = run(["gh", "auth", "setup-git", "--hostname", "github.com"],
+            timeout=GIT_CREDENTIAL_TIMEOUT)
+    if r.returncode == 0:
+        print("luv: git had no GitHub login here, so it now uses gh's "
+              "(ran 'gh auth setup-git')", file=sys.stderr)
+        return
+    print("luv: warning: git has no GitHub login, so private repos will ask for "
+          "one and pushes will fail", file=sys.stderr)
+    detail = r.stderr.strip().splitlines()
+    if detail:
+        print(f"  gh auth setup-git: {detail[-1]}", file=sys.stderr)
 
 
 def pick_org() -> str:
@@ -3795,6 +3838,10 @@ Docker:
                         extra_env={k: v for k, v in os.environ.items()
                                    if env_mode and k.startswith("LUV_") and len(k) > 4})
         return  # unreachable
+
+    # From here on this machine clones, fetches, and hands over to an agent that
+    # will push. Not any earlier: a dispatched session's luv sees to its own host.
+    ensure_git_credentials()
 
     if args[0] == "--clean":
         cmd_clean(force=force, safe=safe)

@@ -89,6 +89,11 @@ For an unattended machine, a token works too:
 echo "ghp_yourtoken" | gh auth login --with-token
 ```
 
+A token login sets up `gh` but not git. luv notices when git has no GitHub login
+and runs `gh auth setup-git` for you, so sessions can clone private repos and
+push. That edits the user's `~/.gitconfig`, for GitHub's hosts only. Run it
+yourself if you want plain `git` working on that machine before luv first runs.
+
 ### 3. luv itself
 
 ```bash
@@ -526,6 +531,17 @@ The key isn't installed or isn't being offered. Test with `ssh -v box`. Check
 **`gh: To get started with GitHub CLI, please run: gh auth login`**
 `gh` is authenticated on your laptop but not on the remote. luv numbers
 workspaces with `gh api` *on the remote*, so it needs its own login there.
+
+**`Username for 'https://github.com':`, or `git push` fails, though `gh` is logged in**
+`gh` and git keep separate credentials, and a public repo clones without any, so
+this shows up on the first private repo or the first push. luv runs
+`gh auth setup-git` when git has no login at all, so seeing this means that step
+failed, and luv will have printed a warning saying why.
+
+**`git clone` says `Repository not found`, but `gh` can see the repo**
+git has a login of its own, for an account that can't see the repo. luv leaves
+those alone, because it may be on purpose. `gh auth setup-git` makes git use
+`gh`'s account for all of `github.com` on that machine.
 
 **The agent can't find an API key / a tool it needs is missing**
 Sessions inherit your rc: before cloning or launching, luv asks the remote's
