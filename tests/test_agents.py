@@ -75,6 +75,7 @@ class AgentLaunchTests(unittest.TestCase):
     def test_main_routes_codex_to_existing_workspace(self):
         with (patch.object(sys, "argv", ["luv", "--codex", "org/repo", "7"]),
               patch.object(luv, "load_config", return_value={"org": "org"}),
+              patch.object(luv, "ensure_git_credentials"),
               patch.object(luv, "open_existing") as open_existing):
             luv.main()
 
@@ -108,6 +109,8 @@ class RemoteDispatchTests(unittest.TestCase):
             # test that stops dispatching can never eat the real ~/prs.
             patch.object(luv, "PRS_DIR", root / "prs"),
             patch.object(luv, "_force_rmtree"),
+            # The same goes for the local path's edit to the global git config.
+            patch.object(luv, "ensure_git_credentials"),
         ]
         for p in self.patches:
             p.start()
@@ -247,6 +250,22 @@ class RemoteDispatchTests(unittest.TestCase):
             luv.main()
 
         self.assertTrue(open_existing.called)
+
+    def test_dispatch_leaves_git_on_this_machine_alone(self):
+        # The session runs over there, and the luv on that end sees to its host.
+        self._dispatch(["myrepo", "go"])
+
+        luv.ensure_git_credentials.assert_not_called()
+
+    def test_inner_luv_sees_to_git_on_its_own_host(self):
+        with (patch.object(luv, "open_existing"),
+              patch.object(luv, "apply_shell_env"),
+              patch.dict(luv.os.environ, {"_LUV_INNER": "1"}),
+              patch.object(sys, "argv", ["luv", "myrepo", "7"]),
+              contextlib.redirect_stdout(io.StringIO())):
+            luv.main()
+
+        luv.ensure_git_credentials.assert_called_once()
 
     def test_org_is_resolved_locally(self):
         argv = self._dispatch(["myrepo", "go"])
@@ -982,6 +1001,232 @@ class ApplyShellEnvTests(unittest.TestCase):
 
         self.assertFalse(probed)
         self.assertNotIn("API_KEY", env)
+
+
+class GitCredentialsTests(unittest.TestCase):
+    """gh's login is no use to git until git is told about it."""
+
+    NO_LOGIN = _completed(
+        returncode=128,
+        stderr="fatal: could not read Username for 'https://github.com': "
+               "terminal prompts disabled\n")
+
+    def _ensure(self, fill, setup=None, which=lambda name: f"/bin/{name}"):
+        """Run it with git and gh stubbed; returns the commands and the output."""
+        answers = {"git": fill, "gh": setup or _completed()}
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            return answers[cmd[0]]
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with (patch.object(luv.shutil, "which", side_effect=which),
+              patch.object(luv, "run", side_effect=fake_run),
+              contextlib.redirect_stdout(stdout),
+              contextlib.redirect_stderr(stderr)):
+            luv.ensure_git_credentials()
+        return calls, stdout.getvalue() + stderr.getvalue()
+
+    def test_git_with_no_login_is_pointed_at_gh(self):
+        calls, said = self._ensure(self.NO_LOGIN)
+
+        self.assertEqual([cmd for cmd, _ in calls],
+                         [["git", "credential", "fill"],
+                          ["gh", "auth", "setup-git", "--hostname", "github.com"]])
+        self.assertIn("gh auth setup-git", said)
+
+    def test_a_login_git_already_has_is_left_alone(self):
+        calls, said = self._ensure(_completed("username=me\npassword=s3cret\n"))
+
+        self.assertEqual([cmd[0] for cmd, _ in calls], ["git"])
+        self.assertEqual(said, "")
+
+    def test_a_stuck_helper_is_not_taken_for_no_login(self):
+        # run() turns a timeout into 124. It may be a keychain waiting on a dialog.
+        calls, said = self._ensure(_completed(returncode=124))
+
+        self.assertEqual([cmd[0] for cmd, _ in calls], ["git"])
+        self.assertEqual(said, "")
+
+    def test_asking_git_can_never_ask_the_user(self):
+        calls, _ = self._ensure(_completed())
+
+        kwargs = calls[0][1]
+        self.assertEqual(kwargs["input"], "protocol=https\nhost=github.com\n\n")
+        self.assertEqual(kwargs["env"]["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(kwargs["env"]["GIT_ASKPASS"], "")
+        self.assertEqual(kwargs["env"]["GCM_INTERACTIVE"], "never")
+        self.assertEqual(kwargs["timeout"], luv.GIT_CREDENTIAL_TIMEOUT)
+
+    def test_a_failed_setup_warns_rather_than_stopping_the_session(self):
+        # A public repo still clones, and -n needs no login at all.
+        _, said = self._ensure(
+            self.NO_LOGIN,
+            _completed(returncode=1, stderr="You are not logged into any GitHub "
+                                            "hosts. Run gh auth login.\n"))
+
+        self.assertIn("warning: git has no GitHub login", said)
+        self.assertIn("Run gh auth login", said)
+
+    def test_without_gh_there_is_nothing_to_point_git_at(self):
+        calls, said = self._ensure(
+            self.NO_LOGIN, which=lambda name: None if name == "gh" else f"/bin/{name}")
+
+        self.assertEqual(calls, [])
+        self.assertEqual(said, "")
+
+
+@unittest.skipUnless(shutil.which("git"), "needs git")
+class GitCredentialsRealGitTests(unittest.TestCase):
+    """Real git and a stand-in gh, because the part worth testing is what git does
+    with no login, with a login, and with the askpass an editor's terminal sets."""
+
+    FAKE_GH = """#!/bin/sh
+echo "$*" >> "$(dirname "$0")/gh.log"
+case "$1 $2" in
+"auth setup-git")
+    git config --global --replace-all credential.https://github.com.helper ""
+    git config --global --add credential.https://github.com.helper "!$0 auth git-credential"
+    ;;
+"auth git-credential")
+    [ "$3" = get ] && printf 'username=x-access-token\\npassword=from-gh\\n'
+    ;;
+esac
+"""
+
+    def setUp(self):
+        tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tempdir.cleanup)
+        root = Path(tempdir.name)
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        self.gh_log = bin_dir / "gh.log"
+        self.askpass_ran = root / "askpass-ran"
+        gh = bin_dir / "gh"
+        gh.write_text(self.FAKE_GH)
+        askpass = root / "askpass"
+        askpass.write_text(f'#!/bin/sh\ntouch "{self.askpass_ran}"\n')
+        for script in (gh, askpass):
+            script.chmod(0o755)
+        (root / "gitconfig").touch()
+        # No system config either: on a Mac that brings in osxkeychain, and so
+        # whatever login the developer running this happens to have stored. HOME
+        # is for a git too old to know GIT_CONFIG_GLOBAL, which would otherwise
+        # have the fake gh write to the real ~/.gitconfig.
+        p = patch.dict(luv.os.environ, {
+            "HOME": str(root),
+            "GIT_CONFIG_GLOBAL": str(root / "gitconfig"),
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+            "GIT_ASKPASS": str(askpass),
+            "SSH_ASKPASS": str(askpass),
+        })
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _password(self):
+        """What git would log in with now, or None if it has nothing."""
+        r = subprocess.run(["git", "credential", "fill"],
+                           input="protocol=https\nhost=github.com\n\n",
+                           capture_output=True, text=True,
+                           env={**os.environ, "GIT_TERMINAL_PROMPT": "0",
+                                "GIT_ASKPASS": ""})
+        if r.returncode != 0:
+            return None
+        return dict(line.split("=", 1) for line in r.stdout.splitlines())["password"]
+
+    def _ensure(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            luv.ensure_git_credentials()
+        return stderr.getvalue()
+
+    def test_git_ends_up_logging_in_with_what_gh_has(self):
+        self.assertIsNone(self._password())
+
+        said = self._ensure()
+
+        self.assertEqual(self._password(), "from-gh")
+        self.assertIn("gh auth setup-git", said)
+
+    def test_the_second_run_finds_it_done(self):
+        self._ensure()
+
+        self.assertEqual(self._ensure(), "")
+        self.assertEqual(self.gh_log.read_text().count("setup-git"), 1)
+
+    def test_a_login_git_already_has_stays_the_one_it_uses(self):
+        subprocess.run(["git", "config", "--global", "credential.helper",
+                        "!f() { echo username=me; echo password=mine; }; f"],
+                       check=True)
+
+        self.assertEqual(self._ensure(), "")
+
+        self.assertEqual(self._password(), "mine")
+        self.assertFalse(self.gh_log.exists(), "gh should not have been asked")
+
+    def test_a_helper_left_pointing_at_a_moved_gh_is_repaired(self):
+        subprocess.run(["git", "config", "--global",
+                        "credential.https://github.com.helper",
+                        "!/nowhere/gh auth git-credential"], check=True)
+        self.assertIsNone(self._password())
+
+        self._ensure()
+
+        self.assertEqual(self._password(), "from-gh")
+
+    def test_an_editors_askpass_is_not_run(self):
+        self._ensure()
+
+        self.assertFalse(self.askpass_ran.exists())
+
+    def test_the_credential_itself_is_never_printed(self):
+        self._ensure()
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            luv.ensure_git_credentials()
+
+        self.assertNotIn("from-gh", stdout.getvalue() + stderr.getvalue())
+
+
+class GitCredentialsOrderTests(unittest.TestCase):
+    def _order(self, argv, stub):
+        order = []
+        with (patch.object(sys, "argv", ["luv", "--local"] + argv),
+              patch.dict(luv.os.environ, {"_LUV_INNER": ""}),
+              patch.object(luv, "load_config", return_value={"org": "exo"}),
+              patch.object(luv, "ensure_git_credentials",
+                           side_effect=lambda: order.append("credentials")),
+              patch.object(luv, stub,
+                           side_effect=lambda *a, **k: order.append(stub))):
+            luv.main()
+        return order
+
+    def test_luv_l_has_a_login_before_it_clones(self):
+        self.assertEqual(
+            self._order(["-l", "https://github.com/exo/myrepo/pull/7"], "open_pr"),
+            ["credentials", "open_pr"])
+
+    def test_reopening_a_folder_has_a_login_for_the_push_to_come(self):
+        # Nothing is cloned here, but the agent it hands over to will push.
+        self.assertEqual(self._order(["myrepo", "7"], "open_existing"),
+                         ["credentials", "open_existing"])
+
+    def test_clean_has_a_login_before_it_fetches(self):
+        self.assertEqual(self._order(["--clean"], "cmd_clean"),
+                         ["credentials", "cmd_clean"])
+
+    def test_help_touches_nothing(self):
+        with (patch.object(sys, "argv", ["luv", "--help"]),
+              patch.dict(luv.os.environ, {"_LUV_INNER": ""}),
+              patch.object(luv, "load_config", return_value={}),
+              patch.object(luv, "ensure_git_credentials") as ensure,
+              contextlib.redirect_stdout(io.StringIO()),
+              self.assertRaises(SystemExit)):
+            luv.main()
+
+        ensure.assert_not_called()
 
 
 class CleanGuardTests(unittest.TestCase):

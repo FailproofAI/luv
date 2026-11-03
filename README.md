@@ -14,7 +14,7 @@ uv tool install luv-cli
 pip install luv-cli
 ```
 
-**Requirements:** [GitHub CLI](https://cli.github.com/) (`gh`) plus either Claude Code or Codex must be installed and authenticated.
+**Requirements:** [GitHub CLI](https://cli.github.com/) (`gh`) plus either Claude Code or Codex must be installed and authenticated. If git has no GitHub login of its own, `luv` runs `gh auth setup-git` to point it at `gh`'s, so private repos clone and agents can push.
 
 ## Quick start
 
